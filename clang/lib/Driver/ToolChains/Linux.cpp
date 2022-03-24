@@ -271,8 +271,8 @@ Linux::Linux(const Driver &D, const llvm::Triple &Triple, const ArgList &Args)
     // to the detected gcc install, because if we are using devtoolset gcc then
     // we want to use other tools from devtoolset (e.g. ld) instead of the
     // standard system tools.
-    PPaths.push_back(Twine(GCCInstallation.getParentLibPath() +
-                     "/../bin").str());
+    PPaths.push_back(
+        Twine(GCCInstallation.getParentLibPath() + "/../bin").str());
 
   if (Arch == llvm::Triple::arm || Arch == llvm::Triple::thumb)
     ExtraOpts.push_back("-X");
@@ -820,6 +820,8 @@ SanitizerMask Linux::getSupportedSanitizers() const {
   Res |= SanitizerKind::Vptr;
   Res |= SanitizerKind::SafeStack;
   if (IsX86_64 || IsMIPS64 || IsAArch64 || IsLoongArch64)
+    Res |= SanitizerKind::LKMMDepChecker;
+  if (IsX86_64 || IsMIPS64 || IsAArch64)
     Res |= SanitizerKind::DataFlow;
   if (IsX86_64 || IsMIPS64 || IsAArch64 || IsX86 || IsArmArch || IsPowerPC64 ||
       IsRISCV64 || IsSystemZ || IsHexagon || IsLoongArch64)

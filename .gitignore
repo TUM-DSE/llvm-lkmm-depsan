@@ -57,7 +57,8 @@ autoconf/autom4te.cache
 # Directories to ignore (do not add trailing '/'s, they skip symlinks).
 #==============================================================================#
 # VS2017 and VSCode config files.
-.vscode
+!/.vscode
+/.vscode/*.log
 .vs
 #zed config files
 .zed
@@ -73,3 +74,14 @@ pythonenv*
 /clang/utils/analyzer/projects/*/RefScanBuildResults
 # automodapi puts generated documentation files here.
 /lldb/docs/python_api/
+
+
+#==============================================================================#
+# Nix-related
+#==============================================================================#
+.direnv
+
+#==============================================================================#
+# Project BDO-related
+#==============================================================================#
+.compile_args

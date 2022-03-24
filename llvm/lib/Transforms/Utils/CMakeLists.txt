@@ -41,6 +41,8 @@ add_llvm_component_library(LLVMTransformUtils
   IRNormalizer.cpp
   LCSSA.cpp
   LibCallsShrinkWrap.cpp
+  LKMMDependenceAnalysis.cpp
+  LKMMDependenceBreaker.cpp
   Local.cpp
   LoopConstrainer.cpp
   LoopPeel.cpp

@@ -1088,13 +1088,13 @@ void EmitAssemblyHelper::RunOptimizationPipeline(
     if (LangOpts.Sanitize.has(SanitizerKind::LKMMDepChecker)) {
       if (CodeGenOpts.OptimizationLevel == 0) {
         PB.registerPipelineStartEPCallback(
-            [](ModulePassManager &MPM, OptimizationLevel Level) {
-              MPM.addPass(LKMMAnnotateHook());
+            [this](ModulePassManager &MPM, OptimizationLevel Level) {
+              MPM.addPass(LKMMAnnotateHook(CodeGenOpts.SanitizeLKMMDepCheckerOutdir));
             });
       } else {
         PB.registerPipelineStartEPCallback(
-            [](ModulePassManager &MPM, OptimizationLevel Level) {
-              MPM.addPass(LKMMAnnotateHook());
+            [this](ModulePassManager &MPM, OptimizationLevel Level) {
+              MPM.addPass(LKMMAnnotateHook(CodeGenOpts.SanitizeLKMMDepCheckerOutdir));
             });
         PB.registerOptimizerLastEPCallback(
             [](ModulePassManager &MPM, OptimizationLevel Level, ThinOrFullLTOPhase) {

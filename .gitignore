@@ -52,6 +52,8 @@ autoconf/autom4te.cache
 # CLion project configuration
 /.idea
 /cmake-build*
+# flake hacks
+.pwd
 
 #==============================================================================#
 # Directories to ignore (do not add trailing '/'s, they skip symlinks).

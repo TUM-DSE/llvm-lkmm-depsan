@@ -176,7 +176,7 @@ MODULE_PASS("verify", VerifierPass())
 MODULE_PASS("view-callgraph", CallGraphViewerPass())
 MODULE_PASS("wholeprogramdevirt", WholeProgramDevirtPass())
 MODULE_PASS("lkmm-verify-deps", LKMMVerifyDepsPass())
-MODULE_PASS("lkmm-hook-deps", LKMMAnnotateHook())
+//MODULE_PASS("lkmm-hook-deps", LKMMAnnotateHook())
 MODULE_PASS("lkmm-break-deps", LKMMBreakingPass())
 #undef MODULE_PASS
 

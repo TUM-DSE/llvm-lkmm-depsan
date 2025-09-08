@@ -23,7 +23,6 @@
 #include "llvm/ADT/Hashing.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallVector.h"
-#include "llvm/ADT/Statistic.h"
 #include "llvm/Analysis/CFG.h"
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/PostDominators.h"
@@ -46,7 +45,8 @@
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/raw_ostream.h"
-#include <functional>
+#include <chrono>
+#include <format>
 
 #define DEBUG_TYPE "lkmm-dep-analyzer"
 
@@ -154,7 +154,7 @@ MK_STATS(Combined)
 
 static int OutFD[2] = {2, 2};
 
-static const std::string Prefix = "LKMM-Out/";
+static std::string Prefix = "LKMM-Def-Out/";
 
 namespace llvm {
 
@@ -184,6 +184,18 @@ std::string getInstLocString(const StringRef &F ,const DebugLoc &InstDebugLoc, b
     return InstDebugLoc.get()->getFilename().str() + LiAndCol;
 
   return (F.str()) + LiAndCol;
+}
+
+void setupResultDir(const std::string &OutPath) {
+
+  bool Is;
+  if (auto C = sys::fs::is_directory(OutPath, Is)) {
+      errs() << "Code: " << C.message() << "\n";
+      errs() << "Output directory does not exist: " << OutPath << "\n";
+      llvm_unreachable("Invalid output directory. Use -fsanitize-lkmm-dep-checker-outdir=<path>");
+  }
+  Prefix = OutPath;
+  if (OutPath.back() != '/') Prefix += '/';
 }
 
 template <DepType DT>
@@ -1555,8 +1567,10 @@ template <DepType DT>
 llvm::LKMMAnnotateDeps::DepMap *LKMMSearchPolicy::LKMMAnnotator::run(Module &M, ModuleAnalysisManager &AM) {
   AnnotCtx<DT> AC(Kind, AnnoFn, PrevResult);
 
-  EnableStatistics(true);
   reset();
+
+  if (M.empty())
+    return AC.getResult();
 
   for (auto &F : M) {
 

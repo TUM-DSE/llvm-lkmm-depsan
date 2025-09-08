@@ -76,6 +76,8 @@ class SanitizerArgs {
 
   std::string MemtagMode;
 
+  std::string LKMMDepCheckerOutdir;
+
 public:
   /// Parses the sanitizer arguments from an argument list.
   SanitizerArgs(const ToolChain &TC, const llvm::opt::ArgList &Args,

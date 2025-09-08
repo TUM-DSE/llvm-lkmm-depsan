@@ -21,6 +21,7 @@
 #include <unordered_set>
 
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/Statistic.h"
 #include "llvm/IR/DebugInfoMetadata.h"
 #include "llvm/IR/PassManager.h"
 
@@ -29,6 +30,12 @@
 
 namespace llvm {
   class LKMMAnnotateDeps;
+
+
+//===----------------------------------------------------------------------===//
+// Some helpers
+//===----------------------------------------------------------------------===//
+void setupResultDir(const std::string &OutPath);
 
 //===----------------------------------------------------------------------===//
 // Some common types
@@ -444,14 +451,21 @@ private:
 /// the earliest hook point.
 class LKMMAnnotateHook : public PassInfoMixin<LKMMAnnotateHook> {
 public:
+  LKMMAnnotateHook(const std::string OutPath) : OutPath(OutPath) {};
 
   PreservedAnalyses run(Module &M, ModuleAnalysisManager &AM) {
+
+    EnableStatistics(true);
+    setupResultDir(OutPath);
 
     errs() << "\nvvvvv~~~~~~~~~ LKMMAnnotateHook ~~~~~vvvvv\n";
     auto &Annotations = AM.getResult<LKMMAnnotateDepsPass>(M);
     errs() << "\n^^^^^~~~~~~~~~ LKMMAnnotateHook ~~~~~^^^^^\n";
     return PreservedAnalyses::all();
   }
+
+private:
+  const std::string OutPath;
 };
 
 //===----------------------------------------------------------------------===//

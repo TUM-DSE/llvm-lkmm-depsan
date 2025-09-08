@@ -519,6 +519,9 @@ public:
   /// See -fms-secure-hotpatch-functions-list.
   std::vector<std::string> MSSecureHotPatchFunctionsList;
 
+  /// The path where the LKMM DepChecker should write its output.
+  std::string SanitizeLKMMDepCheckerOutdir;
+
 public:
   // Define accessors/mutators for code generation options of enumeration type.
 #define CODEGENOPT(Name, Bits, Default, Compatibility)

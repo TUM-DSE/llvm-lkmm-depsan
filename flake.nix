@@ -19,6 +19,7 @@
           pkgs.cmake
           pkgs.ninja
           pkgs.gdb
+          pkgs.llvmPackages_20.clang-tools
         ];
         hardeningDisable = [ "all" ];
       };

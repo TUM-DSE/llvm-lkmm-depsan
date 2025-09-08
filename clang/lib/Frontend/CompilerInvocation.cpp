@@ -2341,6 +2341,9 @@ bool CompilerInvocation::ParseCodeGenArgs(CodeGenOptions &Opts, ArgList &Args,
       "-fsanitize-skip-hot-cutoff=",
       Args.getAllArgValues(OPT_fsanitize_skip_hot_cutoff_EQ), Diags);
 
+  // Parse -fsanitize-lkmm-dep-checker-outdir= arguments.
+  Opts.SanitizeLKMMDepCheckerOutdir = Args.getLastArgValue(OPT_sanitize_lkmm_dep_checker_outdir);
+
   parseSanitizerKinds(
       "-fsanitize-annotate-debug-info=",
       Args.getAllArgValues(OPT_fsanitize_annotate_debug_info_EQ), Diags,

@@ -995,6 +995,12 @@ SanitizerArgs::SanitizerArgs(const ToolChain &TC,
     }
   }
 
+  //Parse -fsanitize-lkmm-dep-checker-outdir
+  for (const auto *Arg : Args.filtered(options::OPT_sanitize_lkmm_dep_checker_outdir)) {
+    Arg->claim();
+    LKMMDepCheckerOutdir = Arg->getValue();
+  }
+
   // Parse -fsanitize-metadata-ignorelist option if enabled.
   if (BinaryMetadataFeatures) {
     parseSpecialCaseListArg(
@@ -1538,6 +1544,11 @@ void SanitizerArgs::addArgs(const ToolChain &TC, const llvm::opt::ArgList &Args,
     CmdArgs.push_back("-fno-builtin-strstr");
     CmdArgs.push_back("-fno-builtin-strcasestr");
     CmdArgs.push_back("-fno-builtin-memmem");
+  }
+
+  if (Sanitizers.has(SanitizerKind::LKMMDepChecker)) {
+    CmdArgs.push_back(Args.MakeArgString(
+    "-fsanitize-lkmm-dep-checker-outdir=" + LKMMDepCheckerOutdir));
   }
 
   // Require -fvisibility= flag on non-Windows when compiling if vptr CFI is

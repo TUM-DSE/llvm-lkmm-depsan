@@ -2681,6 +2681,12 @@ def fsanitize_skip_hot_cutoff_EQ
           "(0.0 [default] = skip none; 1.0 = skip all). "
           "Argument format: <sanitizer1>=<value1>,<sanitizer2>=<value2>,...">;
 
+def sanitize_lkmm_dep_checker_outdir
+  : Joined<["-"], "fsanitize-lkmm-dep-checker-outdir=">,
+    Visibility<[CC1Option]>, MarshallingInfoString<CodeGenOpts<"SanitizeLKMMDepCheckerOutdir">>,
+    HelpText<"Directory in which to store the output of the LKMM DepChecker">,
+    Group<f_clang_Group>;
+
 } // end -f[no-]sanitize* flags
 
 def fallow_runtime_check_skip_hot_cutoff_EQ

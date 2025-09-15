@@ -631,6 +631,9 @@ public:
 #undef ASSIGN
   }
 
+  void setPDT(PostDominatorTree &PDT) { this->PDT = &PDT; }
+  PostDominatorTree &getPDT() { return *PDT; }
+
   // Only runs once. Annotates ALL segments ending in volatile loads and stores.
   void passOne(Function *NewF) {
     this->F = NewF;
@@ -812,6 +815,8 @@ private:
   MayRiseDeps_t *MR = nullptr;
   MayRiseRisingDeps_t *MRR = nullptr;
   MayRiseMayDangleDeps_t *MRMD = nullptr;
+
+  PostDominatorTree *PDT = nullptr;
 
   void (*AnnotateFn)(const SegmentID<0,0, LKMMSearchPolicy> &Seg, const DepType Type, LKMMAnnotateDeps::DepMap *Result);
 
@@ -1359,15 +1364,18 @@ void BUCtx<DepType::CTRL>::searchInScope(LoadInst &LI) {
     if (Cond == BB.getTerminator())
       continue;
 
-    bool IsAlwaysReachable = true;
-    bool IsReachableOnce = false;
-    for (auto *Succ: Cond->successors()) {
-      bool tmp = isPotentiallyReachable(Succ, &BB);
-      IsAlwaysReachable &= tmp;
-      IsReachableOnce |= tmp; // false positives!
-    }
+    // bool IsAlwaysReachable = true;
+    // bool IsReachableOnce = false;
+    // for (auto *Succ: Cond->successors()) {
+    //   bool tmp = isPotentiallyReachable(Succ, &BB);
+    //   IsAlwaysReachable &= tmp;
+    //   IsReachableOnce |= tmp; // false positives!
+    // }
 
-    if (!IsReachableOnce)
+    // if (!IsReachableOnce)
+    //   continue;
+
+    if (Ann->getPDT().dominates(&BB, Cond->getParent()))
       continue;
 
     // All branches lead to BB -> syntactic dependency at best
@@ -1693,11 +1701,14 @@ llvm::LKMMAnnotateDeps::DepMap *LKMMSearchPolicy::LKMMAnnotator::run(Module &M, 
               DanglingDeps.get(), RisingDanglingDeps.get(), MayDangleDanglingDeps.get(),
               MayRiseDeps.get(), MayRiseRisingDeps.get(), MayRiseMayDangleDeps.get());
 
+  auto &FAM = AM.getResult<FunctionAnalysisManagerModuleProxy>(M).getManager();
   for (auto &F : M) {
 
     // TODO: check?
     if (F.empty())
       continue;
+
+    AC.setPDT(FAM.getResult<PostDominatorTreeAnalysis>(F));
 
     // Annotate dependencies ending in volatile loads and stores.
     AC.passOne(&F);

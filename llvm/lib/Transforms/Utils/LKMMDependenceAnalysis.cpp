@@ -199,7 +199,7 @@ void setupResultDir(const std::string &OutPath) {
 }
 
 template <DepType DT>
-constexpr StringRef calls() {
+static constexpr StringRef calls() {
   if constexpr (DT == DepType::ADDR)
     return "calls_addr_dep";
   if constexpr (DT == DepType::DATA)
@@ -211,7 +211,7 @@ constexpr StringRef calls() {
 }
 
 template <DepType DT>
-constexpr StringRef returns() {
+static constexpr StringRef returns() {
   if constexpr (DT == DepType::ADDR)
     return "returns_addr_dep";
   if constexpr (DT == DepType::DATA)
@@ -224,7 +224,7 @@ constexpr StringRef returns() {
 
 
 template <DepType DT>
-constexpr StringRef takes() {
+static constexpr StringRef takes() {
   if constexpr (DT == DepType::ADDR)
     return "takes_addr_dep";
   if constexpr (DT == DepType::DATA)
@@ -236,7 +236,7 @@ constexpr StringRef takes() {
 }
 
 template <DepType DT>
-constexpr StringRef is() {
+static constexpr StringRef is() {
   if constexpr (DT == DepType::ADDR)
     return "is_addr_dep";
   if constexpr (DT == DepType::DATA)
@@ -248,7 +248,7 @@ constexpr StringRef is() {
 }
 
 template <DepType DT>
-constexpr StringRef begins() {
+static constexpr StringRef begins() {
   if constexpr (DT == DepType::ADDR)
     return "begins_addr_dep";
   if constexpr (DT == DepType::DATA)
@@ -260,13 +260,25 @@ constexpr StringRef begins() {
 }
 
 template <DepType DT>
-constexpr StringRef ends() {
+static constexpr StringRef ends() {
   if constexpr (DT == DepType::ADDR)
     return "ends_addr_dep";
   if constexpr (DT == DepType::DATA)
     return "ends_data_dep";
   if constexpr (DT == DepType::CTRL)
     return "ends_ctrl_dep";
+
+    llvm_unreachable("Unknown dep type");
+}
+
+template <DepType DT>
+static constexpr StringRef deps() {
+  if constexpr (DT == DepType::ADDR)
+    return "Address Dependency";
+  if constexpr (DT == DepType::DATA)
+    return "Data Dependency";
+  if constexpr (DT == DepType::CTRL)
+    return "Control Dependency";
 
     llvm_unreachable("Unknown dep type");
 }
@@ -293,7 +305,7 @@ public:
   DCLink(Instruction *Val, const DCLevel Lvl, int Depth) : DCLinkBase(Val->getDebugLoc()?Val->getDebugLoc().get():nullptr, Lvl, Depth), Val(Val) {}
   ~DCLink() = default;
 
-  DCLink(const DCLink &Other) : DCLinkBase(Other.Loc.get(), Other.Lvl, Other.Depth), Val(Other.Val) {}
+  DCLink(const DCLink &Other) : DCLinkBase(Other.Loc, Other.Lvl, Other.Depth), Val(Other.Val) {}
 
   Instruction *Val;
 
@@ -315,7 +327,7 @@ public:
   ~DCLink() = default;
 
   // Convenience copy constructor
-  DCLink(const LKMMSearchPolicy::DCLink &Other) : DCLinkBase(Other.Loc, Other.Lvl, Other.getDepth()), F(Other.Val->getFunction()), Type(DCLinkType::VALUE) {
+  DCLink(const LKMMSearchPolicy::DCLink &Other) : DCLinkBase(Other.Loc.value().get(), Other.Lvl, Other.getDepth()), F(Other.Val->getFunction()), Type(DCLinkType::VALUE) {
     if (Other.isCall()) Type = DCLinkType::CALL;
     if (Other.isRet()) Type = DCLinkType::RETURN;
   }
@@ -325,7 +337,9 @@ public:
 
   bool operator==(const DCLinkBase &Other) const override {
     const auto &O = static_cast<const DCLink &>(Other);
-    return Loc->getLine() == O.Loc->getLine() && Loc.getCol() == O.Loc.getCol() && Depth == O.Depth;
+    if (!Loc.has_value() || !O.Loc.has_value())
+      return false;
+    return Loc.value()->getLine() == O.Loc.value()->getLine() && Loc.value().getCol() == O.Loc.value().getCol() && Depth == O.Depth;
   }
 
   // Ok to keep pointers to functions.
@@ -345,10 +359,10 @@ bool DC<Context>::addLink(const typename Context::DCLink &Link, std::optional<in
   // In source level chains, we only add Links with a location.
   // This can happen when declaring local variables.
   // And we do not care about allocas.
-  if constexpr (std::is_same_v<Context, LKMMSearchPolicy>) {
-    if (!Link.Loc)
-      return false;
-  }
+  //if constexpr (std::is_same_v<Context, LKMMSearchPolicy>) {
+  //  if (!Link.Loc)
+  //    return false;
+  //}
 
   if (Chain.empty()) {
     ArgE = Arg;
@@ -378,11 +392,11 @@ template<>
 bool DC<LKMMSearchPolicy>::insertLink(Instruction *Val, DCLevel Lvl, std::optional<int> Arg) {
   LKMMSearchPolicy::DCLink Link(Val, Lvl, 0);
 
-  if (!Link.Loc)
-      return false;
+  //if (!Link.Loc)
+  //    return false;
 
   Chain.insert(Chain.begin(), Link);
-  ArgB = Arg;
+  ArgE = Arg;
   return true;
 }
 
@@ -418,6 +432,10 @@ template<>
 template<>
 DC<LKMMAnnotateDeps>::DC(const DC<LKMMSearchPolicy> &Other) {
   for (const auto &Link : Other.Chain) {
+    if (!Link.Loc)
+      continue;
+    if (!Link.Loc.value())
+      continue;
     auto NewLink = LKMMAnnotateDeps::DCLink(Link);
     addLink(NewLink);
   }
@@ -458,7 +476,9 @@ void SegmentID<B, E, C>::makePretty() {
   if constexpr (std::is_same_v<C, LKMMSearchPolicy>) {
     Pretty = "";
     for (auto I = Dc.Chain.crbegin(); I != Dc.Chain.crend(); I++) {
-      Pretty += getInstLocString(I->Val->getFunction()->getName(), I->Loc, true);
+      if (!I->Val)
+        continue;
+      Pretty += getInstLocString(I->Val->getFunction()->getName(), I->Loc.value(), true);
       if (I != std::prev(Dc.Chain.crend())) {
         Pretty += "\n";
       }
@@ -518,9 +538,9 @@ public:
   //void visitReturnInst(ReturnInst &ReturnI);
 
   // Continue search through other instructions.
-  void visitUnaryOperator(UnaryOperator &UnOp) {};
+  void visitUnaryOperator(UnaryOperator &UO);
 
-  void visitBinaryOperator(BinaryOperator &BinOp) {};
+  void visitBinaryOperator(BinaryOperator &BinOp);
 
   void visitExtractElementInst(ExtractElementInst &EEI) {};
 
@@ -550,7 +570,7 @@ public:
 
   void visitZExtInst(ZExtInst &ZI) {};
 
-  void visitSExtInst(SExtInst &SI) {};
+  void visitSExtInst(SExtInst &SI);
 
   void visitPtrToIntInst(PtrToIntInst &PTI) {};
 
@@ -616,7 +636,7 @@ public:
     this->F = NewF;
 
     if constexpr (DT == DepType::CTRL)
-      CurrPass = Pass::Known_Beg;
+      CurrPass = Pass::Known_Cond;
     this->runSearch();
   }
 
@@ -627,6 +647,9 @@ public:
     this->F = NewF;
 
     CurrPass = Pass::Known_Ret;
+
+    if constexpr (DT == DepType::CTRL)
+      CurrPass = Pass::Any_Call;
     this->runSearch();
   }
 
@@ -637,6 +660,9 @@ public:
     this->F = NewF;
 
     CurrPass = Pass::Known_Call;
+
+    if constexpr (DT == DepType::CTRL)
+      CurrPass = Pass::Any_End;
     this->runSearch();
   }
 
@@ -684,7 +710,8 @@ public:
 
       Caller->addFnAttr(Attribute::get(Caller->getContext(), calls<DT>()));
       this->F->addFnAttr(Attribute::get(this->F->getContext(), takes<DT>()));
-      this->F->addParamAttr(CurrDC->ArgB.value(), Attribute::get(this->F->getContext(), is<DT>()));
+      if (CurrDC->ArgB.value() >= 0)
+        this->F->addParamAttr(CurrDC->ArgB.value(), Attribute::get(this->F->getContext(), is<DT>()));
     }
 
     if constexpr (B == 1) {
@@ -712,12 +739,13 @@ public:
         assert(Callee->getCalledFunction()->getAttributes().getParamAttrs(CurrDC->ArgE.value()).hasAttribute(is<DT>()) && "Argument should not have been passed in Pass 3");
       }
     }
+
     if constexpr (DT == DepType::CTRL && E == 1) {
 
-      auto *Ret = cast<ReturnInst>(CurrDC->Chain.front().Val);
-      auto *Callee = Ret->getFunction();
-      Callee->addRetAttr(Attribute::get(this->F->getContext(), returns<DT>()));
-      this->F->addFnAttr(Attribute::get(Ret->getContext(), calls<DT>()));
+      auto *Call = cast<CallInst>(CurrDC->Chain.front().Val);
+      auto *Callee = Call->getFunction();
+      Callee->addFnAttr(Attribute::get(Callee->getContext(), takes<DT>()));
+      this->F->addFnAttr(Attribute::get(this->F->getContext(), calls<DT>()));
     }
 
     assert(getDc().Chain.size() > 0 && "Attempting to complete a segment with less than 2 links");
@@ -728,11 +756,14 @@ public:
     getDCPtr().release();
   }
 
-  enum Pass { Known_End, Known_Ret, Known_Call, Known_Beg, Match };
+  enum Pass { Known_End, Known_Ret, Known_Call, Known_Cond, Any_Call, Any_End, Match };
 
   Pass currPass() const { return CurrPass; }
 
   void DUMP() {
+
+    chains(this->getKind()) << "*****~~~~~~~~~~" << deps<DT>() << "~~~~~~~~~~*****\n";
+
 #define PRINT_DEPS(Dep) do { \
   chains(this->getKind()) << std::remove_reference_t<decltype(*Dep)>::value_type::Type << ": " << Dep->size() << "\n"; \
   for (auto &Seg : *Dep) { \
@@ -802,8 +833,8 @@ void LKMMAnnotateDepsPass::annotateChain(const SegmentID<0,0, LKMMSearchPolicy> 
     assert(!Ret.getDC().Chain.empty() && "Cannot annotate empty chain");
 
     for (auto I = Ret.getDC().Chain.crbegin(); I != Ret.getDC().Chain.crend(); I++) {
-      Annot += getInstLocString(I->F->getName(), I->Loc);
-      Pretty += std::string(I->getDepth(), '\t') + getInstLocString(I->F->getName(), I->Loc);
+      Annot += getInstLocString(I->F->getName(), I->Loc.value());
+      Pretty += std::string(I->getDepth(), '\t') + getInstLocString(I->F->getName(), I->Loc.value());
       if (I != std::prev(Ret.getDC().Chain.crend())) {
         Annot += "--";
         Pretty += "\n";
@@ -857,8 +888,8 @@ void LKMMVerifyDepsPass::addChain(const SegmentID<0,0, LKMMSearchPolicy> &Seg, c
   assert(!Ret.getDC().Chain.empty() && "Cannot annotate empty chain");
 
   for (auto I = Ret.getDC().Chain.crbegin(); I != Ret.getDC().Chain.crend(); I++) {
-    Annot += getInstLocString(I->F->getName(), I->Loc);
-    Pretty += std::string(I->getDepth(), '\t') + getInstLocString(I->F->getName(), I->Loc);
+    Annot += getInstLocString(I->F->getName(), I->Loc.value());
+    Pretty += std::string(I->getDepth(), '\t') + getInstLocString(I->F->getName(), I->Loc.value());
     if (I != std::prev(Ret.getDC().Chain.crend())) {
       Annot += "--";
       Pretty += "\n";
@@ -1157,7 +1188,7 @@ void BUCtx<DepType::CTRL>::visitBasicBlock(BasicBlock &BB) {
   // Search is different for control dependencies.
   // First we check all conditionals, if they depend on a volatile load. (so far, so normal)
   // Then we check all volatile stores and calls that don't post-dominate the branch.
-  if (Ann->currPass() == LKMMSearchPolicy::AnnotCtx<DT>::Pass::Known_Beg) {
+  if (Ann->currPass() == LKMMSearchPolicy::AnnotCtx<DT>::Pass::Known_Cond) {
     auto *Term = BB.getTerminator();
     if (auto *BI = dyn_cast<BranchInst>(Term)) {
       if (!BI->isConditional())
@@ -1167,6 +1198,62 @@ void BUCtx<DepType::CTRL>::visitBasicBlock(BasicBlock &BB) {
       End->addLink(BI, DCLevel::EMPTY);
       Ann->setNewDc(std::move(End));
       visit(BI->getCondition());
+    }
+  }
+  if (Ann->currPass() == LKMMSearchPolicy::AnnotCtx<DT>::Pass::Any_Call) {
+    for (auto &I : BB) {
+
+      if (auto *CI = dyn_cast<CallInst>(&I)) {
+        auto End = std::make_unique<DC<LKMMSearchPolicy>>();
+        End->addLink(CI, DCLevel::EMPTY, -1);
+        Ann->setNewDc(std::move(End));
+        // Add Beg immediatly
+        for (auto *Caller : F->users()) {
+          if (auto *CallingI = dyn_cast<CallInst>(Caller)) {
+            if (CI == CallingI)
+              continue;
+            if (!CallingI->getFunction()->hasFnAttribute(calls<DT>()))
+              continue;
+
+            auto Curr = Ann->getDCPtr();
+            auto Cpy = std::make_unique<DC<LKMMSearchPolicy>>(*Curr);
+
+            Ann->setNewDc(std::move(Cpy));
+            Ann->getDc().addLink(CallingI, DCLevel::EMPTY, -1);
+            Ann->template makeIntactDep<-1, 1>();
+
+            Ann->setNewDc(std::move(Curr));
+          }
+        }
+      }
+    }
+  }
+  if (Ann->currPass() == LKMMSearchPolicy::AnnotCtx<DT>::Pass::Any_End) {
+    for (auto &I : BB) {
+
+      if (auto *SI = dyn_cast<StoreInst>(&I)) {
+        if (!SI->isVolatile())
+          continue;
+        auto End = std::make_unique<DC<LKMMSearchPolicy>>();
+        End->addLink(SI, DCLevel::EMPTY);
+        Ann->setNewDc(std::move(End));
+        // Add Beg immediatly
+        for (auto *Caller : F->users()) {
+          if (auto *CallingI = dyn_cast<CallInst>(Caller)) {
+            if (!CallingI->getFunction()->hasFnAttribute(calls<DT>()))
+              continue;
+
+            auto Curr = Ann->getDCPtr();
+            auto Cpy = std::make_unique<DC<LKMMSearchPolicy>>(*Curr);
+
+            Ann->setNewDc(std::move(Cpy));
+            Ann->getDc().addLink(CallingI, DCLevel::EMPTY, -1);
+            Ann->template makeIntactDep<-1, 0>();
+
+            Ann->setNewDc(std::move(Curr));
+          }
+        }
+      }
     }
   }
 }
@@ -1194,7 +1281,10 @@ void BUCtx<DT>::visitArgument(Argument *A) {
   // Add a new segment for all call sites of F (likely outside of F)
 
   for (auto *CallingInstr : F->users()) {
+
     if (auto *CI = dyn_cast<CallInst>(CallingInstr)) {
+      if (CI->getFunction() == F)
+        continue;
 
       auto Curr = Ann->getDCPtr();
       auto Cpy = std::make_unique<DC<LKMMSearchPolicy>>(*Curr);
@@ -1281,8 +1371,9 @@ void BUCtx<DepType::CTRL>::searchInScope(LoadInst &LI) {
       continue;
 
     // All branches lead to BB -> syntactic dependency at best
-    if (IsAlwaysReachable)
-      continue;
+    // TODO: compund conditions
+    //if (IsAlwaysReachable)
+    //  continue;
 
     for (auto &I : BB) {
       if (auto *SI = dyn_cast<StoreInst>(&I)) {
@@ -1305,22 +1396,16 @@ void BUCtx<DepType::CTRL>::searchInScope(LoadInst &LI) {
         if (!Callee)
           continue;
 
-        for (auto &CBB : *Callee) {
-          if (auto *RI = dyn_cast<ReturnInst>(CBB.getTerminator())) {
-            auto Curr = Ann->getDCPtr();
-            auto Cpy = std::make_unique<DC<LKMMSearchPolicy>>(*Curr);
+        auto Curr = Ann->getDCPtr();
+        auto Cpy = std::make_unique<DC<LKMMSearchPolicy>>(*Curr);
 
-            Ann->setNewDc(std::move(Cpy));
-            Ann->getDc().addLink(&LI, DCLevel::PTE);
-            Ann->getDc().insertLink(RI, getLastNonEmptyLvl(Curr->Chain));
+        Ann->setNewDc(std::move(Cpy));
+        Ann->getDc().addLink(&LI, DCLevel::PTE);
+        Ann->getDc().insertLink(CI, DCLevel::BOTH, -1);
 
-            Ann->template makeIntactDep<0, 1>();
-            Ann->setNewDc(std::move(Curr));
-          }
-        }
+        Ann->template makeIntactDep<0, 1>();
+        Ann->setNewDc(std::move(Curr));
       }
-
-
     }
   }
 
@@ -1354,6 +1439,8 @@ void BUCtx<DT>::goThroughMem(LoadInst &LI) {
 
   // Find previous stores that write the same location and continue there.
   // Anything else is potential alias territory (conservatively speaking)
+  //if (!LI.getPointerOperand()->hasOneUse())
+  //  return;
   for (auto *U : LI.getPointerOperand()->users()) {
     if (!isa<StoreInst>(U))
       continue;
@@ -1390,8 +1477,8 @@ void BUCtx<DT>::visitGetElementPtrInst(GetElementPtrInst &GEP) {
   // GEP is a glorified add
   auto *Ann = (LKMMSearchPolicy::AnnotCtx<DT> *)this;
 
-  assert(getLastNonEmptyLvl(Ann->getDc().Chain) == DCLevel::PTR &&
-         "Expected a pointer to be the last link in the chain for GEP");
+  //assert(getLastNonEmptyLvl(Ann->getDc().Chain) == DCLevel::PTR &&
+  //      "Expected a pointer to be the last link in the chain for GEP");
 
   Ann->getDc().addLink(&GEP, DCLevel::PTR);
 
@@ -1452,6 +1539,36 @@ void BUCtx<DT>::visitSelectInst(SelectInst &SI) {
 
 
   for (auto &Op : SI.operands()) {
+    auto Curr = Ann->getDCPtr();
+    auto Cpy = std::make_unique<DC<LKMMSearchPolicy>>(*Curr);
+
+    Ann->setNewDc(std::move(Cpy));
+    visit(Op);
+    Ann->setNewDc(std::move(Curr));
+  }
+}
+
+template <DepType DT>
+void BUCtx<DT>::visitUnaryOperator(UnaryOperator &UO) {
+  auto *Ann = (LKMMSearchPolicy::AnnotCtx<DT> *)this;
+  Ann->getDc().addLink(&UO, getLastNonEmptyLvl(Ann->getDc().Chain));
+  visit(UO.getOperand(0));
+}
+
+template <DepType DT>
+void BUCtx<DT>::visitSExtInst(SExtInst &SI) {
+  auto *Ann = (LKMMSearchPolicy::AnnotCtx<DT> *)this;
+  Ann->getDc().addLink(&SI, getLastNonEmptyLvl(Ann->getDc().Chain));
+  visit(SI.getOperand(0));
+}
+
+template <DepType DT>
+void BUCtx<DT>::visitBinaryOperator(BinaryOperator &BinOp) {
+  auto *Ann = (LKMMSearchPolicy::AnnotCtx<DT> *)this;
+  Ann->getDc().addLink(&BinOp, getLastNonEmptyLvl(Ann->getDc().Chain));
+
+
+  for (auto &Op : BinOp.operands()) {
     auto Curr = Ann->getDCPtr();
     auto Cpy = std::make_unique<DC<LKMMSearchPolicy>>(*Curr);
 
@@ -1572,15 +1689,15 @@ llvm::LKMMAnnotateDeps::DepMap *LKMMSearchPolicy::LKMMAnnotator::run(Module &M, 
   if (M.empty())
     return AC.getResult();
 
+  AC.populate(IntactDeps.get(), RisingDeps.get(), MayDangleDeps.get(),
+              DanglingDeps.get(), RisingDanglingDeps.get(), MayDangleDanglingDeps.get(),
+              MayRiseDeps.get(), MayRiseRisingDeps.get(), MayRiseMayDangleDeps.get());
+
   for (auto &F : M) {
 
     // TODO: check?
     if (F.empty())
       continue;
-
-    AC.populate(IntactDeps.get(), RisingDeps.get(), MayDangleDeps.get(),
-                DanglingDeps.get(), RisingDanglingDeps.get(), MayDangleDanglingDeps.get(),
-                MayRiseDeps.get(), MayRiseRisingDeps.get(), MayRiseMayDangleDeps.get());
 
     // Annotate dependencies ending in volatile loads and stores.
     AC.passOne(&F);
@@ -1591,19 +1708,36 @@ llvm::LKMMAnnotateDeps::DepMap *LKMMSearchPolicy::LKMMAnnotator::run(Module &M, 
     Depth--;
 
     for (auto &F : M) {
-      //Annotate dependencies ending in returns.
-      if (!F.getAttributes().getRetAttrs().hasAttribute(returns<DT>()))
-        continue;
+      if constexpr (DT == DepType::CTRL) {
+        //Annotate dependencies ending in nested calls.
+        if (!F.hasFnAttribute(takes<DT>()))
+          continue;
+      } else {
+        //Annotate dependencies ending in returns.
+        if (!F.getAttributes().getRetAttrs().hasAttribute(returns<DT>()))
+          continue;
+      }
       AC.passTwo(&F);
     }
 
     for (auto &F : M) {
-      //Annotate dependencies ending in calls.
-      if (!F.hasFnAttribute(calls<DT>()))
-        continue;
+      if constexpr (DT == DepType::CTRL) {
+        //Annotate dependencies ending in nested ends.
+        if (!F.hasFnAttribute(takes<DT>()))
+          continue;
+      } else {
+        //Annotate dependencies ending in calls.
+        if (!F.hasFnAttribute(calls<DT>()))
+          continue;
+      }
       AC.passThree(&F);
     }
   } while (updateStats(DT) && Depth);
+
+#define REMOVE_DUP(name) \
+  removeDuplicates(*name##Deps.get());
+  FOR_EACH_DEP(REMOVE_DUP);
+#undef REMOVE_DUP
 
   AC.merge(5);
   return AC.getResult();
@@ -1647,7 +1781,7 @@ void LKMMVerifyDepsPass::verifyChain(LKMMAnnotateDeps::DepMap *Pre, LKMMAnnotate
         });
         if (Jt == Seg.getDC().Chain.cend()) {
           Matches << raw_fd_ostream::Colors::RED << "Missing Link:\n";
-          Matches << raw_fd_ostream::Colors::RESET << getInstLocString(Link->F->getName(), Link->Loc, false) << "\n\n";
+          Matches << raw_fd_ostream::Colors::RESET << getInstLocString(Link->F->getName(), Link->Loc.value(), false) << "\n\n";
           break;
         }
       }

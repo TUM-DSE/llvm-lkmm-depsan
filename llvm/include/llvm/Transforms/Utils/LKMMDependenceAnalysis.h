@@ -66,13 +66,13 @@ enum CtxKind { CK_Annot, CK_Ver };
 
 class DCLinkBase {
 public:
-  DCLinkBase(DILocation *Loc, DCLevel Lvl, int Depth)
+  DCLinkBase(std::optional<DebugLoc> Loc, DCLevel Lvl, int Depth)
       : Loc(Loc), Lvl(Lvl), Depth(Depth) {}
 
   //DCLinkBase(const DCLinkBase &Other) : Loc(Other.Loc), Lvl(Other.Lvl), Depth(Other.Depth) {}
   virtual ~DCLinkBase() = default;
 
-  DebugLoc Loc;
+  std::optional<DebugLoc> Loc;
   DCLevel Lvl;
 
   bool isCall() const;
@@ -145,10 +145,15 @@ struct DC {
       const auto &L = Chain[i];
       const auto &R = Other.Chain[i];
 
-      if (L.Loc.getLine() != R.Loc.getLine())
-        return L.Loc.getLine() < R.Loc.getLine();
-      if (L.Loc.getCol() != R.Loc.getCol())
-        return L.Loc.getCol() < R.Loc.getCol();
+      if (!L.Loc || !R.Loc)
+        continue;
+      if (!L.Loc.value() || !R.Loc.value())
+        continue;
+
+      if (L.Loc.value().getLine() != R.Loc.value().getLine())
+        return L.Loc.value().getLine() < R.Loc.value().getLine();
+      if (L.Loc.value().getCol() != R.Loc.value().getCol())
+        return L.Loc.value().getCol() < R.Loc.value().getCol();
     }
 
     if (ArgB != Other.ArgB)
@@ -206,7 +211,8 @@ public:
   template<typename O>
   SegmentID(const SegmentID<B,E,O> &Other) : Pretty(Other.Pretty), Dc(Other.getDC()) {}
 
-  //SegmentID(SegmentID<B,E,C> &Other) : Dc(Other.getDC()) {}
+  //SegmentID(SegmentID<B,E,C> &&Other) : Pretty(std::move(Other.Pretty)), Dc(std::move(Other.Dc)) {};
+  //SegmentID(SegmentID<B,E,C> &Other) : Pretty(Other.Pretty), Dc(Other.getDC()) {};
 
   //SegmentID& operator=(const SegmentID<B,E,C> &Other) { Dc = Other.getDC(); return *this; }
 
@@ -246,14 +252,24 @@ public:
   // (3) by earliest beg loc
   // Since we search bottom up, the annotator will insert the segments in roughly this order
   bool operator<(const SegmentID &Other) const {
-    auto LEnd = this->getEnd();
-    auto REnd = Other.getEnd();
+    auto LEndOpt = this->getEnd();
+    auto REndOpt = Other.getEnd();
 
-    if (LEnd != REnd) {
-      if (!LEnd)
+    if (LEndOpt != REndOpt) {
+      if (!LEndOpt)
         return true;
-      if (!REnd)
+      if (!REndOpt)
         return false;
+
+      auto LEnd = LEndOpt.value();
+      auto REnd = REndOpt.value();
+
+      if (LEnd != REnd) {
+        if (!LEnd)
+          return true;
+        if (!REnd)
+          return false;
+      }
 
       auto *LScope = cast_or_null<DIScope>(LEnd->getScope());
       auto *RScope = cast_or_null<DIScope>(REnd->getScope());
@@ -275,14 +291,17 @@ public:
         return LEnd.getCol() < REnd.getCol();
     }
 
-    auto LBegin = this->getBegin();
-    auto RBegin = Other.getBegin();
+    auto LBeginOpt = this->getBegin();
+    auto RBeginOpt = Other.getBegin();
 
-    if (LBegin != RBegin) {
-      if (!LBegin)
+    if (LBeginOpt != RBeginOpt) {
+      if (!LBeginOpt)
         return true;
-      if (!RBegin)
+      if (!RBeginOpt)
         return false;
+
+      auto LBegin = LBeginOpt.value();
+      auto RBegin = RBeginOpt.value();
 
       if (LBegin.getLine() != RBegin.getLine())
         return LBegin.getLine() < RBegin.getLine();
@@ -309,8 +328,8 @@ public:
   static bool lt(const SegmentID &LHS, const SegmentID &RHS) {
     if (LHS < RHS)
       return true;
-    //if (RHS < LHS)
-    //  return false;
+    if (RHS < LHS)
+      return false;
     return LHS.Dc < RHS.Dc;
   }
 
@@ -320,8 +339,8 @@ public:
 
   // TODO: string_view?
   const std::string_view &getType() const { return Type; }
-  const DebugLoc getBegin() const { return Dc.Chain.back().Loc; }
-  const DebugLoc getEnd() const { return Dc.Chain.front().Loc; }
+  const std::optional<DebugLoc> getBegin() const { return Dc.Chain.back().Loc; }
+  const std::optional<DebugLoc> getEnd() const { return Dc.Chain.front().Loc; }
   std::optional<int> getArgB() const { return Dc.ArgB; }
   std::optional<int> getArgE() const { return Dc.ArgE; }
   constexpr int getB() const { return B; }
@@ -335,6 +354,9 @@ public:
 private:
   DC<C> Dc;
 };
+
+//static_assert(std::is_move_constructible_v<SegmentID<0,0,llvm::LKMMAnnotateDeps>>);
+//static_assert(std::is_nothrow_move_constructible_v<SegmentID<0,0,llvm::LKMMAnnotateDeps>>);
 
 //===----------------------------------------------------------------------===//
 // Some helper functions

@@ -63,15 +63,15 @@
   DO(MayRiseMayDangle)
 
 #define FOR_EACH_DP(DO)\
-  if (I) { DO(I) } \
-  if (R) { DO(R) } \
-  if (MD) { DO(MD) } \
-  if (D) { DO(D) } \
-  if (RD) { DO(RD) } \
-  if (MDD) { DO(MDD) } \
-  if (MR) { DO(MR) } \
-  if (MRR) { DO(MRR) } \
-  if (MRMD) { DO(MRMD) }
+  DO(I) \
+  DO(R) \
+  DO(MD) \
+  DO(D) \
+  DO(RD) \
+  DO(MDD) \
+  DO(MR) \
+  DO(MRR) \
+  DO(MRMD)
 
 #define MK_COUNTS(NAME) \
   static llvm::TrackingStatistic Num##NAME[3][2][2] = { \
@@ -152,7 +152,13 @@ MK_COUNTS(Combined)
 
 MK_STATS(Combined)
 
+#define MAX_SIZE_PER_BUCKET 1000
+#define MAX_CHAIN_LENGTH    200
+#define MAX_VISITED_LINKS   1000000
+
 static int OutFD[2] = {2, 2};
+static size_t LinksVisited = 0;
+static bool Exiting = false;
 
 static std::string Prefix = "LKMM-Def-Out/";
 
@@ -311,6 +317,7 @@ public:
 
   bool isCall() const { return CallInst::classof(Val); }
   bool isRet() const { return ReturnInst::classof(Val); }
+  bool isCtrl() const { return BranchInst::classof(Val); }
 
   bool operator==(const DCLinkBase &Other) const override {
     const auto &O = static_cast<const DCLink &>(Other);
@@ -330,10 +337,13 @@ public:
   DCLink(const LKMMSearchPolicy::DCLink &Other) : DCLinkBase(Other.Loc.value().get(), Other.Lvl, Other.getDepth()), F(Other.Val->getFunction()), Type(DCLinkType::VALUE) {
     if (Other.isCall()) Type = DCLinkType::CALL;
     if (Other.isRet()) Type = DCLinkType::RETURN;
+    if (Other.isCtrl()) Type = DCLinkType::CONTROL;
   }
 
+  bool isVal() const { return Type == DCLinkType::VALUE; }
   bool isCall() const { return Type == DCLinkType::CALL; }
   bool isRet() const { return Type == DCLinkType::RETURN; }
+  bool isCtrl() const { return Type == DCLinkType::CONTROL; }
 
   bool operator==(const DCLinkBase &Other) const override {
     const auto &O = static_cast<const DCLink &>(Other);
@@ -525,7 +535,7 @@ public:
   void visitLoad(LoadInst &LI);
 
   // Helper function for visitLoad + ctrl.
-  void searchInScope(LoadInst &LI) = delete;
+  void searchInScope(Instruction &B) = delete;
 
   // Helper function for visitLoad.
   void goThroughMem(LoadInst &LI);
@@ -597,6 +607,8 @@ private:
 
 template<DepType DT>
 class LKMMSearchPolicy::AnnotCtx : public BUCtx<DT> {
+
+  friend class BUCtx<DT>;
 public:
 
   AnnotCtx(CtxKind Ctx,
@@ -746,8 +758,8 @@ public:
     if constexpr (DT == DepType::CTRL && E == 1) {
 
       auto *Call = cast<CallInst>(CurrDC->Chain.front().Val);
-      auto *Callee = Call->getFunction();
-      Callee->addFnAttr(Attribute::get(Callee->getContext(), takes<DT>()));
+      if (auto *Callee = Call->getCalledFunction())
+        Callee->addFnAttr(Attribute::get(Callee->getContext(), takes<DT>()));
       this->F->addFnAttr(Attribute::get(this->F->getContext(), calls<DT>()));
     }
 
@@ -968,7 +980,7 @@ void LKMMSearchPolicy::AnnotCtx<DT>::buildTransitiveClosure(const size_t Depth) 
   auto PrevNeg = std::make_unique<DepMap<-1, 0>>();
   auto CurPos = std::make_unique<DepMap<1, 0>>();
   auto CurNeg = std::make_unique<DepMap<-1, 0>>();
-  size_t Len = 1;
+  size_t Len = 2;
 
   for (auto &Seg : match(MRR, R)) {
     PrevNeg->push_back(Seg);
@@ -986,7 +998,7 @@ void LKMMSearchPolicy::AnnotCtx<DT>::buildTransitiveClosure(const size_t Depth) 
   // sort & remove duplicates ??
 
   // TODO: check for delta
-  while (Len <= Depth-1) {
+  while (Len < Depth-1) {
     for (auto &Seg : match(MRR, PrevNeg.get())) {
       CurNeg->push_back(Seg);
     }
@@ -1064,6 +1076,27 @@ void BUCtx<DT>::handleBranch(BasicBlock *NextBB) {
 template <DepType DT>
 void BUCtx<DT>::visit(Value *V) {
   auto *Ann = (LKMMSearchPolicy::AnnotCtx<DT> *)this;
+
+#define CAP(dep) do { \
+  if (Ann->dep->size() > MAX_SIZE_PER_BUCKET) return; \
+} while(0);
+
+  FOR_EACH_DP(CAP)
+#undef CAP
+
+  if (Ann->getDc().Chain.size() > MAX_CHAIN_LENGTH) {
+    errs() << "[WARN] Chain too long, give up\n";
+    return;
+  }
+  if (LinksVisited > MAX_VISITED_LINKS) {
+    if (!Exiting)
+      errs() << "[WARN] Too many visited links, give up\n";
+    Exiting = true;
+    return;
+  }
+
+  LinksVisited++;
+
   if (auto *I = dyn_cast<Instruction>(V)) {
     auto *NextBB = I->getParent();
     // Whatever we want to insert, it is in a different BB.
@@ -1213,6 +1246,8 @@ void BUCtx<DepType::CTRL>::visitBasicBlock(BasicBlock &BB) {
         End->addLink(CI, DCLevel::EMPTY, -1);
         Ann->setNewDc(std::move(End));
         // Add Beg immediatly
+        if (!F->hasUseList())
+          continue;
         for (auto *Caller : F->users()) {
           if (auto *CallingI = dyn_cast<CallInst>(Caller)) {
             if (CI == CallingI)
@@ -1243,6 +1278,8 @@ void BUCtx<DepType::CTRL>::visitBasicBlock(BasicBlock &BB) {
         End->addLink(SI, DCLevel::EMPTY);
         Ann->setNewDc(std::move(End));
         // Add Beg immediatly
+        if (!F->hasUseList())
+          continue;
         for (auto *Caller : F->users()) {
           if (auto *CallingI = dyn_cast<CallInst>(Caller)) {
             if (!CallingI->getFunction()->hasFnAttribute(calls<DT>()))
@@ -1284,6 +1321,9 @@ void BUCtx<DT>::visitArgument(Argument *A) {
 
   // We found a rising segment!
   // Add a new segment for all call sites of F (likely outside of F)
+
+  if (!F->hasUseList())
+    return;
 
   for (auto *CallingInstr : F->users()) {
 
@@ -1354,7 +1394,7 @@ void BUCtx<DT>::visitLoad(LoadInst &LI) {
 }
 
 template<>
-void BUCtx<DepType::CTRL>::searchInScope(LoadInst &LI) {
+void BUCtx<DepType::CTRL>::searchInScope(Instruction &B) {
 
   auto *Ann = (LKMMSearchPolicy::AnnotCtx<DepType::CTRL> *)this;
   auto *Cond = cast<BranchInst>(Ann->getDc().Chain.front().Val);
@@ -1392,9 +1432,15 @@ void BUCtx<DepType::CTRL>::searchInScope(LoadInst &LI) {
         auto Cpy = std::make_unique<DC<LKMMSearchPolicy>>(*Curr);
 
         Ann->setNewDc(std::move(Cpy));
-        Ann->getDc().addLink(&LI, DCLevel::PTE);
+        Ann->getDc().addLink(&B, DCLevel::PTE);
         Ann->getDc().insertLink(SI, DCLevel::PTE);
-        Ann->makeIntactDep<0, 0>();
+
+        if (auto *_ = dyn_cast<LoadInst>(&B))
+          Ann->makeIntactDep<0, 0>();
+        else if (auto *_ = dyn_cast<CallInst>(&B))
+          Ann->makeIntactDep<-1, 0>();
+        else
+          llvm_unreachable("Unexpected instruction heading ctrl dependency chain");
 
         Ann->setNewDc(std::move(Curr));
       }
@@ -1408,10 +1454,16 @@ void BUCtx<DepType::CTRL>::searchInScope(LoadInst &LI) {
         auto Cpy = std::make_unique<DC<LKMMSearchPolicy>>(*Curr);
 
         Ann->setNewDc(std::move(Cpy));
-        Ann->getDc().addLink(&LI, DCLevel::PTE);
+        Ann->getDc().addLink(&B, DCLevel::PTE);
         Ann->getDc().insertLink(CI, DCLevel::BOTH, -1);
 
-        Ann->template makeIntactDep<0, 1>();
+        if (auto *_ = dyn_cast<LoadInst>(&B))
+          Ann->makeIntactDep<0, 1>();
+        else if (auto *_ = dyn_cast<CallInst>(&B))
+          Ann->makeIntactDep<-1, 1>();
+        else
+          llvm_unreachable("Unexpected instruction heading ctrl dependency chain");
+
         Ann->setNewDc(std::move(Curr));
       }
     }
@@ -1449,6 +1501,9 @@ void BUCtx<DT>::goThroughMem(LoadInst &LI) {
   // Anything else is potential alias territory (conservatively speaking)
   //if (!LI.getPointerOperand()->hasOneUse())
   //  return;
+  if (!LI.getPointerOperand()->hasUseList())
+    return;
+
   for (auto *U : LI.getPointerOperand()->users()) {
     if (!isa<StoreInst>(U))
       continue;
@@ -1750,7 +1805,7 @@ llvm::LKMMAnnotateDeps::DepMap *LKMMSearchPolicy::LKMMAnnotator::run(Module &M, 
   FOR_EACH_DEP(REMOVE_DUP);
 #undef REMOVE_DUP
 
-  AC.merge(5);
+  AC.merge(16);
   return AC.getResult();
 }
 
@@ -1776,27 +1831,44 @@ void LKMMVerifyDepsPass::verifyChain(LKMMAnnotateDeps::DepMap *Pre, LKMMAnnotate
     });
 
     if (It == Post->end()) {
-      Matches << raw_fd_ostream::Colors::RED << "Missing chain for:\n";
+      Matches << raw_fd_ostream::Colors::RED << "Missing chain for [1]:\n";
       Matches << raw_fd_ostream::Colors::RESET << Seg.Pretty << "\n\n";
       continue;
     }
 
     auto Dbg = It;
+    bool Matched = false;
 
     // The segments should be sorted
     while (It != Post->end() && Seg == *It) {
-      for (auto Link = It->getDC().Chain.cbegin(); Link != It->getDC().Chain.cend(); Link++) {
-        auto Jt = std::find_if(Seg.getDC().Chain.cbegin(), Seg.getDC().Chain.cend(),
-          [&Link](const LKMMAnnotateDeps::DCLink &SegLink) {
-          return Link->Loc == SegLink.Loc;
+
+      Matched = true;
+      auto Jt = It->getDC().Chain.cbegin();
+
+      for (auto Link = Seg.getDC().Chain.cbegin(); Link != Seg.getDC().Chain.cend(); Link++) {
+        auto Tmp = std::find_if(Jt, It->getDC().Chain.cend(),
+          [&Link](const LKMMAnnotateDeps::DCLink &PostLink) {
+          return Link->Loc == PostLink.Loc;
         });
-        if (Jt == Seg.getDC().Chain.cend()) {
-          Matches << raw_fd_ostream::Colors::RED << "Missing Link:\n";
-          Matches << raw_fd_ostream::Colors::RESET << getInstLocString(Link->F->getName(), Link->Loc.value(), false) << "\n\n";
-          break;
+        if (Tmp == It->getDC().Chain.cend()) {
+          if (!Link->isCall() && !Link->isVal()) {
+            Matches << raw_fd_ostream::Colors::YELLOW << "Missing Link:\n";
+            Matches << raw_fd_ostream::Colors::RESET << getInstLocString(Link->F->getName(), Link->Loc.value(), false) << "\n\n";
+          Matched = false;
+          }
+          continue;
         }
+        Jt = Tmp;
       }
+      if (Matched)
+        break;
       It++;
+    }
+
+    if (!Matched) {
+      Matches << raw_fd_ostream::Colors::RED << "Missing chain for [2]:\n";
+      Matches << raw_fd_ostream::Colors::RESET << Seg.Pretty << "\n\n";
+      continue;
     }
 
   //#ifdef LLVM_DEBUG
@@ -1805,6 +1877,66 @@ void LKMMVerifyDepsPass::verifyChain(LKMMAnnotateDeps::DepMap *Pre, LKMMAnnotate
     Matches << raw_fd_ostream::Colors::GREEN << "\nPOST_OPT:\n";
     Matches << raw_fd_ostream::Colors::RESET << Dbg->Pretty << "\n\n";
   //#endif
+  }
+}
+
+bool LKMMAnnotatePrimitives::getPrimitiveAnnotB(StringRef Name, const StringRef **Attr) {
+
+  auto *Ptr = find(Begins, Name);
+  if (Ptr == adl_end(Begins))
+    return false;
+
+  *Attr = Ptr;
+  return true;
+}
+bool LKMMAnnotatePrimitives::getPrimitiveAnnotE(StringRef Name, StringRef const **Attr) {
+
+  auto *Ptr = find(Ends, Name);
+  if (Ptr == adl_end(Ends))
+    return false;
+
+  *Attr = Ptr;
+  return true;
+}
+
+void LKMMAnnotatePrimitives::transform(Function &F) {
+
+  bool InPrimitive = false;
+
+  const StringRef *Annot = nullptr;
+  for (auto &BB : F) {
+    for (auto I = BB.begin(); I != BB.end(); I++ ) {
+      if (auto *CI = dyn_cast<CallInst>(I)) {
+        auto *Callee = CI->getCalledFunction();
+        if (!Callee)
+          continue;
+
+        if (getPrimitiveAnnotB(Callee->getName(), &Annot)) {
+          InPrimitive = true;
+          I = CI->eraseFromParent();
+        }
+        else if (getPrimitiveAnnotE(Callee->getName(), &Annot)) {
+          InPrimitive = false;
+          I = CI->eraseFromParent();
+          if (*Annot == "__depsan_ronce_e") {
+            if (auto *LI = dyn_cast<LoadInst>(I)) {
+              for ( size_t i = 0; i < 3; i++ ) {
+                I->addAnnotationMetadata("__depsan_ronce_b");
+                I++;
+              }
+            }
+            else {
+              errs() << "[WARN] READ_ONCE does not end in a load\n";
+            }
+          }
+          Annot = nullptr;
+        }
+      }
+      if (InPrimitive) {
+        assert(Annot && "Missing annotation");
+        I->addAnnotationMetadata(*Annot);
+      }
+    }
   }
 }
 
@@ -1873,6 +2005,22 @@ PreservedAnalyses LKMMVerifyDepsPass::run(Module &M,
   errs() << "\n^^^^^~~~~~~~~~ LKMMVerifyDepsPass ~~~~~^^^^^\n";
 
   return PreservedAnalyses::all();
+}
+
+//===----------------------------------------------------------------------===//
+// The Annotation Transformation
+//===----------------------------------------------------------------------===//
+PreservedAnalyses LKMMAnnotatePrimitives::run(Module &M,
+                                            ModuleAnalysisManager &AM) {
+
+  for (auto &F : M) {
+    if (F.empty())
+      continue;
+
+    transform(F);
+  }
+
+  return PreservedAnalyses::none();
 }
 
 } // namespace llvm

@@ -1089,11 +1089,13 @@ void EmitAssemblyHelper::RunOptimizationPipeline(
       if (CodeGenOpts.OptimizationLevel == 0) {
         PB.registerPipelineStartEPCallback(
             [this](ModulePassManager &MPM, OptimizationLevel Level) {
+              MPM.addPass(LKMMAnnotatePrimitives());
               MPM.addPass(LKMMAnnotateHook(CodeGenOpts.SanitizeLKMMDepCheckerOutdir));
             });
       } else {
         PB.registerPipelineStartEPCallback(
             [this](ModulePassManager &MPM, OptimizationLevel Level) {
+              MPM.addPass(LKMMAnnotatePrimitives());
               MPM.addPass(LKMMAnnotateHook(CodeGenOpts.SanitizeLKMMDepCheckerOutdir));
             });
         PB.registerOptimizerLastEPCallback(

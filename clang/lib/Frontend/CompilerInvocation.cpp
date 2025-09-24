@@ -2343,6 +2343,7 @@ bool CompilerInvocation::ParseCodeGenArgs(CodeGenOptions &Opts, ArgList &Args,
 
   // Parse -fsanitize-lkmm-dep-checker-outdir= arguments.
   Opts.SanitizeLKMMDepCheckerOutdir = Args.getLastArgValue(OPT_sanitize_lkmm_dep_checker_outdir);
+  Opts.SanitizeLKMMDepCheckerIgnoreAnnotations = Args.hasArg(OPT_sanitize_lkmm_dep_checker_ignore_annotations);
 
   parseSanitizerKinds(
       "-fsanitize-annotate-debug-info=",

@@ -407,7 +407,7 @@ public:
   using DC = DC<LKMMAnnotateDeps>;
   using DepMap = std::vector<SegmentID<0,0, LKMMAnnotateDeps>>;
 
-  enum DCLinkType { VALUE, CALL, RETURN };
+  enum DCLinkType { VALUE, CALL, RETURN, CONTROL };
   class DCLink;
 
   DepMap *IntactDeps[3];
@@ -446,6 +446,45 @@ public:
   class AnnotCtx;
 
   class LKMMAnnotator;
+};
+
+//===----------------------------------------------------------------------===//
+// The Annotation Transform
+//===----------------------------------------------------------------------===//
+
+class LKMMAnnotatePrimitives : public PassInfoMixin<LKMMAnnotatePrimitives> {
+public:
+  PreservedAnalyses run(Module &M, ModuleAnalysisManager &AM);
+
+  constexpr static StringRef Begins[] = {
+    "__depsan_mb_b",
+    "__depsan_rmb_b",
+    "__depsan_wmb_b",
+    "__depsan_release_b",
+    "__depsan_acquire_b",
+    "__depsan_atomic_b",
+    "__depsan_ronce_b",
+    "__depsan_wonce_b",
+    "__depsan_lock_b",
+    "__depsan_unlock_b"
+  };
+  constexpr static StringRef Ends[] = {
+    "__depsan_mb_e",
+    "__depsan_rmb_e",
+    "__depsan_wmb_e",
+    "__depsan_release_e",
+    "__depsan_acquire_e",
+    "__depsan_atomic_e",
+    "__depsan_ronce_e",
+    "__depsan_wonce_e",
+    "__depsan_lock_e",
+    "__depsan_unlock_e"
+  };
+
+private:
+  void transform(Function &F);
+  bool getPrimitiveAnnotB(StringRef Name, const StringRef **Attr);
+  bool getPrimitiveAnnotE(StringRef Name, const StringRef **Attr);
 };
 
 //===----------------------------------------------------------------------===//

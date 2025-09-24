@@ -2687,6 +2687,12 @@ def sanitize_lkmm_dep_checker_outdir
     HelpText<"Directory in which to store the output of the LKMM DepChecker">,
     Group<f_clang_Group>;
 
+def sanitize_lkmm_dep_checker_ignore_annotations
+  : Flag<["-"], "fsanitize-lkmm-dep-checker-ignore-annotations">,
+    Visibility<[CC1Option]>, MarshallingInfoFlag<CodeGenOpts<"SanitizeLKMMDepCheckerIgnoreAnnotations">>,
+    HelpText<"Ignore annotations and read all volitile accesses when comuting dependencies">,
+    Group<f_clang_Group>;
+
 } // end -f[no-]sanitize* flags
 
 def fallow_runtime_check_skip_hot_cutoff_EQ

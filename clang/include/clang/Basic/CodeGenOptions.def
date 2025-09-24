@@ -480,6 +480,9 @@ CODEGENOPT(ResMayAlias, 1, 0, Benign)
 ENUM_CODEGENOPT(WinX64EHUnwindV2, llvm::WinX64EHUnwindV2Mode,
                 2, llvm::WinX64EHUnwindV2Mode::Disabled, Benign)
 
+/// Ignore DepSan markers
+CODEGENOPT(SanitizeLKMMDepCheckerIgnoreAnnotations, 1, 0, Benign)
+
 /// FIXME: Make DebugOptions its own top-level .def file.
 #include "DebugOptions.def"
 

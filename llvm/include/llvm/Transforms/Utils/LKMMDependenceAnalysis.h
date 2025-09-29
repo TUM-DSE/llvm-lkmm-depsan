@@ -37,6 +37,8 @@ namespace llvm {
 //===----------------------------------------------------------------------===//
 void setupResultDir(const std::string &OutPath);
 
+bool dbgLocEq(const DebugLoc &L, const DebugLoc &R);
+
 //===----------------------------------------------------------------------===//
 // Some common types
 //===----------------------------------------------------------------------===//
@@ -235,12 +237,12 @@ public:
       if (this->getArgE() != Other.getArgB())
         return false;
 
-      return this->getEnd() == Other.getBegin();
+      return dbgLocEq(this->getEnd(), Other.getBegin());
     }
 
     // D/MD meet at return instructions
     if constexpr (E == -1) {
-      return this->getEnd() == Other.getBegin();
+      return dbgLocEq(this->getEnd(), Other.getBegin());
     }
 
     llvm_unreachable("Invalid segment combination");
@@ -455,6 +457,138 @@ public:
 class LKMMAnnotatePrimitives : public PassInfoMixin<LKMMAnnotatePrimitives> {
 public:
   PreservedAnalyses run(Module &M, ModuleAnalysisManager &AM);
+  constexpr static StringRef Atomics[] = {
+    "atomic_read",
+    "atomic_set",
+    "atomic_read_acquire",
+    "atomic_set_release",
+    "atomic_long_read",
+    "atomic_long_set",
+    "atomic_long_read_acquire",
+    "atomic_long_set_release",
+    "atomic_add",
+    "atomic_sub",
+    "atomic_inc",
+    "atomic_dec",
+    "atomic_and",
+    "atomic_andnot",
+    "atomic_or",
+    "atomic_long_add",
+    "atomic_long_sub",
+    "atomic_long_inc",
+    "atomic_long_dec",
+    "atomic_long_and",
+    "atomic_long_andnot",
+    "atomic_long_or",
+    "atomic_fetch_add",
+    "atomic_fetch_add_relaxed",
+    "atomic_fetch_add_acquire",
+    "atomic_fetch_add_release",
+    "atomic_long_fetch_add",
+    "atomic_long_fetch_add_relaxed",
+    "atomic_long_fetch_add_acquire",
+    "atomic_long_fetch_add_release",
+    "atomic_fetch_inc",
+    "atomic_fetch_inc_relaxed",
+    "atomic_fetch_inc_acquire",
+    "atomic_fetch_inc_release",
+    "atomic_long_fetch_inc",
+    "atomic_long_fetch_inc_relaxed",
+    "atomic_long_fetch_inc_acquire",
+    "atomic_long_fetch_inc_release",
+    "atomic_fetch_sub",
+    "atomic_fetch_sub_relaxed",
+    "atomic_fetch_sub_acquire",
+    "atomic_fetch_sub_release",
+    "atomic_long_fetch_sub",
+    "atomic_long_fetch_sub_relaxed",
+    "atomic_long_fetch_sub_acquire",
+    "atomic_long_fetch_sub_release",
+    "atomic_fetch_dec",
+    "atomic_fetch_dec_relaxed",
+    "atomic_fetch_dec_acquire",
+    "atomic_fetch_dec_release",
+    "atomic_long_fetch_dec",
+    "atomic_long_fetch_dec_relaxed",
+    "atomic_long_fetch_dec_acquire",
+    "atomic_long_fetch_dec_release",
+    "atomic_fetch_and",
+    "atomic_fetch_and_relaxed",
+    "atomic_fetch_and_acquire",
+    "atomic_fetch_and_release",
+    "atomic_long_fetch_and",
+    "atomic_long_fetch_and_relaxed",
+    "atomic_long_fetch_and_acquire",
+    "atomic_long_fetch_and_release",
+    "atomic_fetch_andnot",
+    "atomic_fetch_andnot_relaxed",
+    "atomic_fetch_andnot_acquire",
+    "atomic_fetch_andnot_release",
+    "atomic_long_fetch_andnot",
+    "atomic_long_fetch_andnot_relaxed",
+    "atomic_long_fetch_andnot_acquire",
+    "atomic_long_fetch_andnot_release",
+    "atomic_fetch_or",
+    "atomic_fetch_or_relaxed",
+    "atomic_fetch_or_acquire",
+    "atomic_fetch_or_release",
+    "atomic_long_fetch_or",
+    "atomic_long_fetch_or_relaxed",
+    "atomic_long_fetch_or_acquire",
+    "atomic_long_fetch_or_release",
+    "atomic_add_return",
+    "atomic_add_return_relaxed",
+    "atomic_add_return_acquire",
+    "atomic_add_return_release",
+    "atomic_inc_return",
+    "atomic_inc_return_relaxed",
+    "atomic_inc_return_acquire",
+    "atomic_inc_return_release",
+    "atomic_long_inc_return",
+    "atomic_long_inc_return_relaxed",
+    "atomic_long_inc_return_acquire",
+    "atomic_long_inc_return_release",
+    "atomic_sub_return",
+    "atomic_sub_return_relaxed",
+    "atomic_sub_return_acquire",
+    "atomic_sub_return_release",
+    "atomic_long_sub_return",
+    "atomic_long_sub_return_relaxed",
+    "atomic_long_sub_return_acquire",
+    "atomic_long_sub_return_release",
+    "atomic_dec_return",
+    "atomic_dec_return_relaxed",
+    "atomic_dec_return_acquire",
+    "atomic_dec_return_release",
+    "atomic_long_dec_return",
+    "atomic_long_dec_return_relaxed",
+    "atomic_long_dec_return_acquire",
+    "atomic_long_dec_return_release",
+    "atomic_xchg",
+    "atomic_xchg_relaxed",
+    "atomic_xchg_release",
+    "atomic_xchg_acquire",
+    "atomic_long_xchg",
+    "atomic_long_xchg_relaxed",
+    "atomic_long_xchg_release",
+    "atomic_long_xchg_acquire",
+    "atomic_cmpxchg",
+    "atomic_cmpxchg_relaxed",
+    "atomic_cmpxchg_acquire",
+    "atomic_cmpxchg_release",
+    "atomic_long_cmpxchg",
+    "atomic_long_cmpxchg_relaxed",
+    "atomic_long_cmpxchg_acquire",
+    "atomic_long_cmpxchg_release",
+    "atomic_sub_and_test",
+    "atomic_dec_and_test",
+    "atomic_inc_and_test",
+    "atomic_add_negative",
+    "atomic_long_sub_and_test",
+    "atomic_long_dec_and_test",
+    "atomic_long_inc_and_test",
+    "atomic_long_add_negative",
+  };
 
   constexpr static StringRef Begins[] = {
     "__depsan_mb_b",
@@ -483,6 +617,7 @@ public:
 
 private:
   void transform(Function &F);
+  bool getAtomicAnnot(StringRef Name, const StringRef **Attr);
   bool getPrimitiveAnnotB(StringRef Name, const StringRef **Attr);
   bool getPrimitiveAnnotE(StringRef Name, const StringRef **Attr);
 };

@@ -204,6 +204,20 @@ void setupResultDir(const std::string &OutPath) {
   if (OutPath.back() != '/') Prefix += '/';
 }
 
+bool dbgLocEq(const std::optional<DebugLoc> &L, const std::optional<DebugLoc> &R) {
+  if (!L.has_value() || !R.has_value())
+    return false;
+
+  auto LVal = L.value();
+  auto RVal = R.value();
+
+  if (!LVal || !RVal)
+    return false;
+
+  return LVal.getLine() == RVal.getLine() && LVal.getCol() == RVal.getCol() &&
+         LVal.get()->getFilename() == RVal.get()->getFilename();
+}
+
 template <DepType DT>
 static constexpr StringRef calls() {
   if constexpr (DT == DepType::ADDR)
@@ -425,11 +439,14 @@ DC<LKMMSearchPolicy>::DC(const DC &Beg, const DC &End, int Delta) {
       I->addDepth(Delta);
     }
   }
+
+  auto Tmp = Chain.back().getDepth();
+
   It = Chain.insert(Chain.end(), Beg.Chain.begin(), Beg.Chain.end());
   // Chain: [End.E, ...., End.B, Beg.E, ...., Beg.B]
   if (Delta < 0) {
     for (auto &I = It; I != Chain.end(); I++) {
-      I->addDepth(-Delta);
+      I->addDepth(Tmp-Delta);
     }
   }
   ArgB = Beg.ArgB;
@@ -594,6 +611,8 @@ public:
 
   void visitICmpInst(ICmpInst &ICI) {};
 
+  void setF(Function *F) { this->F = F; }
+
 protected:
   // The function the BFS is currently visiting.
   Function *F;
@@ -614,6 +633,10 @@ public:
   AnnotCtx(CtxKind Ctx,
       void (* AnnoFn)(const SegmentID<0,0, LKMMSearchPolicy> &Seg, const DepType Type, LKMMAnnotateDeps::DepMap *Result),
       LKMMAnnotateDeps *PrevResult) : BUCtx<DT>(Ctx), Result(new(llvm::LKMMAnnotateDeps::DepMap)), CurrPass(Pass::Known_End), AnnotateFn(AnnoFn), PrevResult(PrevResult) {};
+
+  void (*AnnotateFn)(const SegmentID<0,0, LKMMSearchPolicy> &Seg, const DepType Type, LKMMAnnotateDeps::DepMap *Result);
+
+  LKMMAnnotateDeps *PrevResult;
 
   void setNewDc(std::unique_ptr<DC> NewDC) {
     CurrDC = std::move(NewDC);
@@ -642,6 +665,10 @@ public:
     FOR_EACH_DP(ASSIGN)
 #undef ASSIGN
   }
+
+#define GET(Dep) auto *get##Dep() { return Dep; }
+  FOR_EACH_DP(GET)
+#undef GET
 
   void setPDT(PostDominatorTree &PDT) { this->PDT = &PDT; }
   PostDominatorTree &getPDT() { return *PDT; }
@@ -829,10 +856,6 @@ private:
   MayRiseMayDangleDeps_t *MRMD = nullptr;
 
   PostDominatorTree *PDT = nullptr;
-
-  void (*AnnotateFn)(const SegmentID<0,0, LKMMSearchPolicy> &Seg, const DepType Type, LKMMAnnotateDeps::DepMap *Result);
-
-  LKMMAnnotateDeps *PrevResult;
 
   void buildTransitiveClosure(const size_t Depth);
   template<int B, int M, int E>
@@ -1399,6 +1422,10 @@ void BUCtx<DepType::CTRL>::searchInScope(Instruction &B) {
   auto *Ann = (LKMMSearchPolicy::AnnotCtx<DepType::CTRL> *)this;
   auto *Cond = cast<BranchInst>(Ann->getDc().Chain.front().Val);
 
+  LKMMSearchPolicy::AnnotCtx<DepType::DATA> DataAC(Ann->getKind(), Ann->AnnotateFn, Ann->PrevResult);
+  DataAC.populate(Ann->I, Ann->R, Ann->MD, Ann->D, Ann->RD, Ann->MDD, Ann->MR, Ann->MRR, Ann->MRMD);
+  DataAC.setF(Ann->F);
+
   for (auto &BB: *(Cond->getFunction())) {
 
     if (Cond == BB.getTerminator())
@@ -1431,6 +1458,16 @@ void BUCtx<DepType::CTRL>::searchInScope(Instruction &B) {
         auto Curr = Ann->getDCPtr();
         auto Cpy = std::make_unique<DC<LKMMSearchPolicy>>(*Curr);
 
+        if (auto *_ = dyn_cast<ReturnInst>(&B)) {
+          DataAC.setNewDc(std::move(Cpy));
+          DataAC.getDc().addLink(&B, getLastNonEmptyLvl(Curr->Chain));
+          DataAC.getDc().insertLink(SI, DCLevel::PTE);
+          DataAC.makeIntactDep<1, 0>();
+
+          Ann->setNewDc(std::move(Curr));
+          continue;
+        }
+
         Ann->setNewDc(std::move(Cpy));
         Ann->getDc().addLink(&B, DCLevel::PTE);
         Ann->getDc().insertLink(SI, DCLevel::PTE);
@@ -1452,6 +1489,16 @@ void BUCtx<DepType::CTRL>::searchInScope(Instruction &B) {
 
         auto Curr = Ann->getDCPtr();
         auto Cpy = std::make_unique<DC<LKMMSearchPolicy>>(*Curr);
+
+        if (auto *_ = dyn_cast<ReturnInst>(&B)) {
+          DataAC.setNewDc(std::move(Cpy));
+          DataAC.getDc().addLink(&B, getLastNonEmptyLvl(Curr->Chain));
+          DataAC.getDc().insertLink(CI, DCLevel::PTE);
+          DataAC.makeIntactDep<1, 1>();
+
+          Ann->setNewDc(std::move(Curr));
+          continue;
+        }
 
         Ann->setNewDc(std::move(Cpy));
         Ann->getDc().addLink(&B, DCLevel::PTE);
@@ -1575,21 +1622,25 @@ void BUCtx<DT>::visitCallInst(CallInst &CI) {
 
   for (auto &BB : *Callee) {
     if (auto *RI = dyn_cast<ReturnInst>(BB.getTerminator())) {
-      auto Curr = Ann->getDCPtr();
-      auto Cpy = std::make_unique<DC<LKMMSearchPolicy>>(*Curr);
+      if constexpr (DT == DepType::CTRL) {
+        ((LKMMSearchPolicy::AnnotCtx<DepType::CTRL> *)this)->searchInScope(*RI);
+      } else {
+        auto Curr = Ann->getDCPtr();
+        auto Cpy = std::make_unique<DC<LKMMSearchPolicy>>(*Curr);
 
-      Ann->setNewDc(std::move(Cpy));
-      Ann->getDc().addLink(RI, getLastNonEmptyLvl(Curr->Chain));
+        Ann->setNewDc(std::move(Cpy));
+        Ann->getDc().addLink(RI, getLastNonEmptyLvl(Curr->Chain));
 
-      auto *End = Ann->getDc().Chain.front().Val;
-      if (auto *_ = dyn_cast<ReturnInst>(End))
-        Ann->template makeIntactDep<1, -1>();
-      else if (auto *_ = dyn_cast<CallInst>(End))
-        Ann->template makeIntactDep<1, 1>();
-      else
-        Ann->template makeIntactDep<1, 0>();
+        auto *End = Ann->getDc().Chain.front().Val;
+        if (auto *_ = dyn_cast<ReturnInst>(End))
+          Ann->template makeIntactDep<1, -1>();
+        else if (auto *_ = dyn_cast<CallInst>(End))
+          Ann->template makeIntactDep<1, 1>();
+        else
+          Ann->template makeIntactDep<1, 0>();
 
-      Ann->setNewDc(std::move(Curr));
+        Ann->setNewDc(std::move(Curr));
+      }
     }
   }
 }
@@ -1659,7 +1710,7 @@ public:
                     Stats({}) {};
 
   template <DepType DT>
-  llvm::LKMMAnnotateDeps::DepMap *run(Module &M, ModuleAnalysisManager &AM);
+  llvm::LKMMAnnotateDeps::DepMap *run(Module &M, ModuleAnalysisManager &AM, bool KeepPrevSegments = false);
 
 private:
   const CtxKind Kind;
@@ -1692,10 +1743,12 @@ private:
     size_t MayRiseMayDangle;
   } Stats;
 
-  void reset() {
-    IntactDeps->clear();
-    RisingDeps->clear();
-    MayDangleDeps->clear();
+  void reset(bool Full = true) {
+    if (Full) {
+      IntactDeps->clear();
+      RisingDeps->clear();
+      MayDangleDeps->clear();
+    }
     DanglingDeps->clear();
     RisingDanglingDeps->clear();
     MayDangleDanglingDeps->clear();
@@ -1744,10 +1797,12 @@ bool LKMMSearchPolicy::LKMMAnnotator::updateStats(DepType DT) {
 #undef SAVE_STAT
 
 template <DepType DT>
-llvm::LKMMAnnotateDeps::DepMap *LKMMSearchPolicy::LKMMAnnotator::run(Module &M, ModuleAnalysisManager &AM) {
+llvm::LKMMAnnotateDeps::DepMap *LKMMSearchPolicy::LKMMAnnotator::run(Module &M, ModuleAnalysisManager &AM, bool KeepPrevSegments) {
   AnnotCtx<DT> AC(Kind, AnnoFn, PrevResult);
 
-  reset();
+
+  // Ctrl deps can have a data dependency up to the conditional, so we need previously collected segments. EXCEPT <X,0> segments because they would complete data deps which we did already.
+  reset(!KeepPrevSegments);
 
   if (M.empty())
     return AC.getResult();
@@ -1797,6 +1852,22 @@ llvm::LKMMAnnotateDeps::DepMap *LKMMSearchPolicy::LKMMAnnotator::run(Module &M, 
           continue;
       }
       AC.passThree(&F);
+    }
+
+    if constexpr (DT == DepType::CTRL) {
+      LKMMSearchPolicy::AnnotCtx<DepType::DATA> DataAC(AC.getKind(), AC.AnnotateFn, AC.PrevResult);
+      DataAC.populate(AC.getI(), AC.getR(), AC.getMD(), AC.getD(), AC.getRD(), AC.getMDD(), AC.getMR(), AC.getMRR(), AC.getMRMD());
+      // We need to do this after both passTwo and passThree
+      for (auto &F : M) {
+        if (!F.getAttributes().getRetAttrs().hasAttribute(returns<DepType::DATA>()))
+          continue;
+        DataAC.passTwo(&F);
+      }
+      for (auto &F : M) {
+        if (!F.hasFnAttribute(calls<DepType::DATA>()))
+          continue;
+        DataAC.passThree(&F);
+      }
     }
   } while (updateStats(DT) && Depth);
 
@@ -1851,7 +1922,7 @@ void LKMMVerifyDepsPass::verifyChain(LKMMAnnotateDeps::DepMap *Pre, LKMMAnnotate
           return Link->Loc == PostLink.Loc;
         });
         if (Tmp == It->getDC().Chain.cend()) {
-          if (!Link->isCall() && !Link->isVal()) {
+          if (Link->isCtrl()) {
             Matches << raw_fd_ostream::Colors::YELLOW << "Missing Link:\n";
             Matches << raw_fd_ostream::Colors::RESET << getInstLocString(Link->F->getName(), Link->Loc.value(), false) << "\n\n";
           Matched = false;
@@ -1880,6 +1951,15 @@ void LKMMVerifyDepsPass::verifyChain(LKMMAnnotateDeps::DepMap *Pre, LKMMAnnotate
   }
 }
 
+bool LKMMAnnotatePrimitives::getAtomicAnnot(StringRef Name, const StringRef **Attr) {
+
+  auto *Ptr = find(Atomics, Name);
+  if (Ptr == adl_end(Atomics))
+    return false;
+
+  *Attr = Ptr;
+  return true;
+}
 bool LKMMAnnotatePrimitives::getPrimitiveAnnotB(StringRef Name, const StringRef **Attr) {
 
   auto *Ptr = find(Begins, Name);
@@ -1966,7 +2046,7 @@ LKMMAnnotateDeps LKMMAnnotateDepsPass::run(Module &M,
     auto A = LKMMSearchPolicy::LKMMAnnotator(CK_Annot, &annotateChain);
     Ret.add(DepType::ADDR, A.run<DepType::ADDR>(M, AM));
     Ret.add(DepType::DATA, A.run<DepType::DATA>(M, AM));
-    Ret.add(DepType::CTRL, A.run<DepType::CTRL>(M, AM));
+    Ret.add(DepType::CTRL, A.run<DepType::CTRL>(M, AM, true));
   }
 
   Opt << M;
@@ -1997,7 +2077,7 @@ PreservedAnalyses LKMMVerifyDepsPass::run(Module &M,
     auto A = LKMMSearchPolicy::LKMMAnnotator(CK_Ver, &addChain, &Annotations);
     verifyChain(Annotations.IntactDeps[(int)DepType::ADDR], A.run<DepType::ADDR>(M, AM), M);
     verifyChain(Annotations.IntactDeps[(int)DepType::DATA], A.run<DepType::DATA>(M, AM), M);
-    verifyChain(Annotations.IntactDeps[(int)DepType::CTRL], A.run<DepType::CTRL>(M, AM), M);
+    verifyChain(Annotations.IntactDeps[(int)DepType::CTRL], A.run<DepType::CTRL>(M, AM, true), M);
   }
 
   Opt << M;
@@ -2010,12 +2090,34 @@ PreservedAnalyses LKMMVerifyDepsPass::run(Module &M,
 //===----------------------------------------------------------------------===//
 // The Annotation Transformation
 //===----------------------------------------------------------------------===//
+
+static void annotateAllRec(Function &F, const StringRef &Annot) {
+  for (auto &BB : F) {
+    for (auto &I : BB) {
+      I.addAnnotationMetadata(Annot);
+      if (auto *CI = dyn_cast<CallInst>(&I)) {
+        if (!CI->getCalledFunction())
+          continue;
+
+        annotateAllRec(*CI->getCalledFunction(), Annot);
+      }
+    }
+  }
+}
+
 PreservedAnalyses LKMMAnnotatePrimitives::run(Module &M,
                                             ModuleAnalysisManager &AM) {
 
   for (auto &F : M) {
     if (F.empty())
       continue;
+
+
+    const StringRef *Annot = nullptr;
+    if (getAtomicAnnot(F.getName(), &Annot)) {
+      annotateAllRec(F, *Annot);
+      continue;
+    }
 
     transform(F);
   }

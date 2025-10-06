@@ -26,6 +26,7 @@
 #include "llvm/Analysis/CFG.h"
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/PostDominators.h"
+#include "llvm/IR/AttributeMask.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/CFG.h"
 #include "llvm/IR/Constants.h"
@@ -348,7 +349,7 @@ public:
   ~DCLink() = default;
 
   // Convenience copy constructor
-  DCLink(const LKMMSearchPolicy::DCLink &Other) : DCLinkBase(Other.Loc.value().get(), Other.Lvl, Other.getDepth()), F(Other.Val->getFunction()), Type(DCLinkType::VALUE) {
+  DCLink(const LKMMSearchPolicy::DCLink &Other) : DCLinkBase(Other.Loc.value().get(), Other.Lvl, Other.getDepth()), F(Other.Val->getFunction()->getName()), Type(DCLinkType::VALUE) {
     if (Other.isCall()) Type = DCLinkType::CALL;
     if (Other.isRet()) Type = DCLinkType::RETURN;
     if (Other.isCtrl()) Type = DCLinkType::CONTROL;
@@ -366,10 +367,8 @@ public:
     return Loc.value()->getLine() == O.Loc.value()->getLine() && Loc.value().getCol() == O.Loc.value().getCol() && Depth == O.Depth;
   }
 
-  // Ok to keep pointers to functions.
-  // a) Only needed to annotate the IR chains (so definetely valid)
-  // b) Optimizations are unlikely to delete entire functions
-  const Function *F;
+  // Not ok to keep pointers to functions: pro-opt context doesn't exist when verifying
+  const StringRef F;
 private:
   DCLinkType Type;
 };
@@ -778,7 +777,8 @@ public:
       auto *Callee = cast<CallInst>(CurrDC->Chain.front().Val);
       if (Callee->getCalledFunction()) {
         assert(Callee->getCalledFunction()->getAttributes().getFnAttrs().hasAttribute(takes<DT>()) && "Function should not have been passed in Pass 3");
-        assert(Callee->getCalledFunction()->getAttributes().getParamAttrs(CurrDC->ArgE.value()).hasAttribute(is<DT>()) && "Argument should not have been passed in Pass 3");
+        if (CurrDC->ArgE.value() != -1)
+          assert(Callee->getCalledFunction()->getAttributes().getParamAttrs(CurrDC->ArgE.value()).hasAttribute(is<DT>()) && "Argument should not have been passed in Pass 3");
       }
     }
 
@@ -873,8 +873,8 @@ void LKMMAnnotateDepsPass::annotateChain(const SegmentID<0,0, LKMMSearchPolicy> 
     assert(!Ret.getDC().Chain.empty() && "Cannot annotate empty chain");
 
     for (auto I = Ret.getDC().Chain.crbegin(); I != Ret.getDC().Chain.crend(); I++) {
-      Annot += getInstLocString(I->F->getName(), I->Loc.value());
-      Pretty += std::string(I->getDepth(), '\t') + getInstLocString(I->F->getName(), I->Loc.value());
+      Annot += getInstLocString(I->F, I->Loc.value());
+      Pretty += std::string(I->getDepth(), '\t') + getInstLocString(I->F, I->Loc.value());
       if (I != std::prev(Ret.getDC().Chain.crend())) {
         Annot += "--";
         Pretty += "\n";
@@ -928,8 +928,8 @@ void LKMMVerifyDepsPass::addChain(const SegmentID<0,0, LKMMSearchPolicy> &Seg, c
   assert(!Ret.getDC().Chain.empty() && "Cannot annotate empty chain");
 
   for (auto I = Ret.getDC().Chain.crbegin(); I != Ret.getDC().Chain.crend(); I++) {
-    Annot += getInstLocString(I->F->getName(), I->Loc.value());
-    Pretty += std::string(I->getDepth(), '\t') + getInstLocString(I->F->getName(), I->Loc.value());
+    Annot += getInstLocString(I->F, I->Loc.value());
+    Pretty += std::string(I->getDepth(), '\t') + getInstLocString(I->F, I->Loc.value());
     if (I != std::prev(Ret.getDC().Chain.crend())) {
       Annot += "--";
       Pretty += "\n";
@@ -1491,9 +1491,11 @@ void BUCtx<DepType::CTRL>::searchInScope(Instruction &B) {
         auto Cpy = std::make_unique<DC<LKMMSearchPolicy>>(*Curr);
 
         if (auto *_ = dyn_cast<ReturnInst>(&B)) {
+          Callee->addFnAttr(takes<DepType::DATA>());
+
           DataAC.setNewDc(std::move(Cpy));
           DataAC.getDc().addLink(&B, getLastNonEmptyLvl(Curr->Chain));
-          DataAC.getDc().insertLink(CI, DCLevel::PTE);
+          DataAC.getDc().insertLink(CI, DCLevel::PTE, -1);
           DataAC.makeIntactDep<1, 1>();
 
           Ann->setNewDc(std::move(Curr));
@@ -1534,6 +1536,7 @@ template <DepType DT>
 void BUCtx<DT>::goThroughMem(LoadInst &LI) {
 
   auto *Ann = (LKMMSearchPolicy::AnnotCtx<DT> *)this;
+bool dbgLocEq(const DebugLoc &L, const DebugLoc &R);
 
   // TODO: Are double load/stores ok?
   // Sounds like aliasing
@@ -1876,7 +1879,7 @@ llvm::LKMMAnnotateDeps::DepMap *LKMMSearchPolicy::LKMMAnnotator::run(Module &M, 
   FOR_EACH_DEP(REMOVE_DUP);
 #undef REMOVE_DUP
 
-  AC.merge(16);
+  AC.merge(12);
   return AC.getResult();
 }
 
@@ -1924,7 +1927,7 @@ void LKMMVerifyDepsPass::verifyChain(LKMMAnnotateDeps::DepMap *Pre, LKMMAnnotate
         if (Tmp == It->getDC().Chain.cend()) {
           if (Link->isCtrl()) {
             Matches << raw_fd_ostream::Colors::YELLOW << "Missing Link:\n";
-            Matches << raw_fd_ostream::Colors::RESET << getInstLocString(Link->F->getName(), Link->Loc.value(), false) << "\n\n";
+            Matches << raw_fd_ostream::Colors::RESET << getInstLocString(Link->F, Link->Loc.value(), false) << "\n\n";
           Matched = false;
           }
           continue;
@@ -1989,7 +1992,7 @@ void LKMMAnnotatePrimitives::transform(Function &F) {
       if (auto *CI = dyn_cast<CallInst>(I)) {
         auto *Callee = CI->getCalledFunction();
         if (!Callee)
-          continue;
+          goto isAsm;
 
         if (getPrimitiveAnnotB(Callee->getName(), &Annot)) {
           InPrimitive = true;
@@ -2012,6 +2015,7 @@ void LKMMAnnotatePrimitives::transform(Function &F) {
           Annot = nullptr;
         }
       }
+isAsm:
       if (InPrimitive) {
         assert(Annot && "Missing annotation");
         I->addAnnotationMetadata(*Annot);
@@ -2124,5 +2128,53 @@ PreservedAnalyses LKMMAnnotatePrimitives::run(Module &M,
 
   return PreservedAnalyses::none();
 }
+
+//===----------------------------------------------------------------------===//
+// Annotation Removal
+// ===----------------------------------------------------------------------===//
+
+void LKMMRemoveAnnotations::transform(Function &F) {
+
+  auto FnAttrs = AttributeSet::get(F.getContext(), {
+    Attribute::get(F.getContext(), takes<DepType::ADDR>()),
+    Attribute::get(F.getContext(), takes<DepType::DATA>()),
+    Attribute::get(F.getContext(), takes<DepType::CTRL>()),
+    Attribute::get(F.getContext(), calls<DepType::ADDR>()),
+    Attribute::get(F.getContext(), calls<DepType::DATA>()),
+    Attribute::get(F.getContext(), calls<DepType::CTRL>()),
+  });
+
+  auto RetAttrs = AttributeSet::get(F.getContext(), {
+    Attribute::get(F.getContext(), returns<DepType::ADDR>()),
+    Attribute::get(F.getContext(), returns<DepType::DATA>()),
+    Attribute::get(F.getContext(), returns<DepType::CTRL>())
+  });
+
+  auto ParamAttrs = AttributeSet::get(F.getContext(), {
+    Attribute::get(F.getContext(), is<DepType::ADDR>()),
+    Attribute::get(F.getContext(), is<DepType::DATA>()),
+    Attribute::get(F.getContext(), is<DepType::CTRL>())
+  });
+
+  F.removeFnAttrs(FnAttrs);
+  F.removeRetAttrs(RetAttrs);
+  for (size_t Idx=0; Idx < F.arg_size(); Idx++) {
+    F.removeParamAttrs(Idx, ParamAttrs);
+  }
+}
+
+PreservedAnalyses LKMMRemoveAnnotations::run(Module &M,
+                                            ModuleAnalysisManager &AM) {
+
+  for (auto &F : M) {
+    if (F.empty())
+      continue;
+
+    transform(F);
+  }
+
+  return PreservedAnalyses::none();
+}
+
 
 } // namespace llvm

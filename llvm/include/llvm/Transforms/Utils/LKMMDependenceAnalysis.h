@@ -266,12 +266,8 @@ public:
       auto LEnd = LEndOpt.value();
       auto REnd = REndOpt.value();
 
-      if (LEnd != REnd) {
-        if (!LEnd)
-          return true;
-        if (!REnd)
-          return false;
-      }
+      if (!LEnd || !REnd)
+        return false;
 
       auto *LScope = cast_or_null<DIScope>(LEnd->getScope());
       auto *RScope = cast_or_null<DIScope>(REnd->getScope());
@@ -620,6 +616,18 @@ private:
   bool getAtomicAnnot(StringRef Name, const StringRef **Attr);
   bool getPrimitiveAnnotB(StringRef Name, const StringRef **Attr);
   bool getPrimitiveAnnotE(StringRef Name, const StringRef **Attr);
+};
+
+//===----------------------------------------------------------------------===//
+// The Annotation Removal
+//===----------------------------------------------------------------------===//
+
+class LKMMRemoveAnnotations : public PassInfoMixin<LKMMRemoveAnnotations> {
+public:
+  PreservedAnalyses run(Module &M, ModuleAnalysisManager &AM);
+
+private:
+  void transform(Function &F);
 };
 
 //===----------------------------------------------------------------------===//

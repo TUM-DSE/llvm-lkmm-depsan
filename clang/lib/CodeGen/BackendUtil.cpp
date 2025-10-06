@@ -1101,6 +1101,7 @@ void EmitAssemblyHelper::RunOptimizationPipeline(
         PB.registerOptimizerLastEPCallback(
             [](ModulePassManager &MPM, OptimizationLevel Level, ThinOrFullLTOPhase) {
               MPM.addPass(LKMMVerifyDepsPass());
+              MPM.addPass(LKMMRemoveAnnotations());
             });
       }
     }

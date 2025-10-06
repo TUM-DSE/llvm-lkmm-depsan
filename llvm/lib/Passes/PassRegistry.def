@@ -179,6 +179,7 @@ MODULE_PASS("lkmm-verify-deps", LKMMVerifyDepsPass())
 //MODULE_PASS("lkmm-hook-deps", LKMMAnnotateHook())
 MODULE_PASS("lkmm-break-deps", LKMMBreakingPass())
 MODULE_PASS("lkmm-annotate", LKMMAnnotatePrimitives())
+MODULE_PASS("lkmm-remove-annot", LKMMRemoveAnnotations())
 #undef MODULE_PASS
 
 #ifndef MODULE_PASS_WITH_PARAMS

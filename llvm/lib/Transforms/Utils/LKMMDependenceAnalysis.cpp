@@ -48,6 +48,7 @@
 #include "llvm/Support/raw_ostream.h"
 #include <chrono>
 #include <format>
+#include <variant>
 
 #define DEBUG_TYPE "lkmm-dep-analyzer"
 
@@ -73,6 +74,26 @@
   DO(MR) \
   DO(MRR) \
   DO(MRMD)
+
+#define FOR_RISING_DP(DO)\
+  DO(R) \
+  DO(RD) \
+  DO(MRR) \
+
+#define FOR_DANGLING_DP(DO)\
+  DO(D) \
+  DO(RD) \
+  DO(MDD) \
+
+#define FOR_MAYRISE_DP(DO)\
+  DO(MR) \
+  DO(MRR) \
+  DO(MRMD) \
+
+#define FOR_MAYDANGLE_DP(DO)\
+  DO(MD) \
+  DO(MDD) \
+  DO(MRMD) \
 
 #define MK_COUNTS(NAME) \
   static llvm::TrackingStatistic Num##NAME[3][2][2] = { \
@@ -156,6 +177,7 @@ MK_STATS(Combined)
 #define MAX_SIZE_PER_BUCKET 1000
 #define MAX_CHAIN_LENGTH    200
 #define MAX_VISITED_LINKS   1000000
+#define MAX_CHAINS_PER_INST 1000
 
 static int OutFD[2] = {2, 2};
 static size_t LinksVisited = 0;
@@ -299,6 +321,17 @@ static constexpr StringRef deps() {
   if constexpr (DT == DepType::DATA)
     return "Data Dependency";
   if constexpr (DT == DepType::CTRL)
+    return "Control Dependency";
+
+    llvm_unreachable("Unknown dep type");
+}
+
+static constexpr StringRef DepToStr(const DepType DT) {
+  if (DT == DepType::ADDR)
+    return "Address Dependency";
+  if (DT == DepType::DATA)
+    return "Data Dependency";
+  if (DT == DepType::CTRL)
     return "Control Dependency";
 
     llvm_unreachable("Unknown dep type");
@@ -514,6 +547,139 @@ void SegmentID<B, E, C>::makePretty() {
   }
 }
 
+
+template<int B, int E, typename C>
+void SegmentGraph::addSegment(SegmentID<B,E,C> *Seg) {
+  Nodes.push_back(std::make_unique<SegmentNode>(Seg));
+
+  if constexpr (B == 0)
+    StartSet.push_back(Nodes.back().get());
+}
+
+template<int B, int E, typename C>
+SegmentNode* SegmentGraph::getSegmentNode(SegmentID<B,E,C> *Seg) {
+  for (auto &N : Nodes) {
+    if (N->Seg == (void *)Seg)
+      return N.get();
+  }
+  return nullptr;
+}
+
+template<int B, int M, int E, typename C>
+void SegmentGraph::addEdge(SegmentID<B,M,C> *From, SegmentID<-M,E,C> *To) {
+  auto FromN = getSegmentNode(From);
+  auto ToN = getSegmentNode(To);
+
+  assert(FromN && "<From> not in graph");
+  assert(ToN && "<To> not in graph");
+
+  FromN->Successors.push_back(ToN);
+}
+
+template<int FE>
+const SegmentID<0,0,LKMMSearchPolicy> mkSeg(const SmallVector<SegmentNode*, 16> &Path) {
+
+  using AnySeg = std::variant<
+    SegmentID<0, 1, LKMMSearchPolicy>,
+    SegmentID<0, -1, LKMMSearchPolicy>,
+    SegmentID<0, 0, LKMMSearchPolicy>,
+    SegmentID<1, 1, LKMMSearchPolicy>,
+    SegmentID<1, -1, LKMMSearchPolicy>,
+    SegmentID<1, 0, LKMMSearchPolicy>,
+    SegmentID<-1, 1, LKMMSearchPolicy>,
+    SegmentID<-1, -1, LKMMSearchPolicy>,
+    SegmentID<-1, 0, LKMMSearchPolicy>>;
+
+  AnySeg Res = *static_cast<SegmentID<0,FE,LKMMSearchPolicy> *>(Path.front()->Seg);
+
+  for (auto *N = Path.begin()+1; N != Path.end(); N++) {
+    if ((*N)->E == -1) { // <0, -X> -- <X, -1>
+      if ((*N)->B == -1) {
+        auto B = get<SegmentID<0, 1, LKMMSearchPolicy>>(Res);
+        auto *E = static_cast<SegmentID<-1, -1, LKMMSearchPolicy> *>((*N)->Seg);
+
+        Res = SegmentID<0, -1, LKMMSearchPolicy>(B, *E);
+      } else {
+        auto B = get<SegmentID<0, -1, LKMMSearchPolicy>>(Res);
+        auto *E = static_cast<SegmentID<1, -1, LKMMSearchPolicy> *>((*N)->Seg);
+
+        Res = SegmentID<0, -1, LKMMSearchPolicy>(B, *E);
+      }
+    } else if ((*N)->E == 1) { // <0, -X> -- <X, 1>
+      if ((*N)->B == -1) {
+        auto B = get<SegmentID<0, 1, LKMMSearchPolicy>>(Res);
+        auto *E = static_cast<SegmentID<-1, 1, LKMMSearchPolicy> *>((*N)->Seg);
+
+        Res = SegmentID<0, 1, LKMMSearchPolicy>(B, *E);
+      } else {
+        auto B = get<SegmentID<0, -1, LKMMSearchPolicy>>(Res);
+        auto *E = static_cast<SegmentID<1, 1, LKMMSearchPolicy> *>((*N)->Seg);
+
+        Res = SegmentID<0, 1, LKMMSearchPolicy>(B, *E);
+      }
+    } else { // <0, -X> -- <X, 0>
+      if ((*N)->B == -1) {
+        auto B = get<SegmentID<0, 1, LKMMSearchPolicy>>(Res);
+        auto *E = static_cast<SegmentID<-1, 0, LKMMSearchPolicy> *>((*N)->Seg);
+
+        Res = SegmentID<0, 0, LKMMSearchPolicy>(B, *E);
+      } else {
+        auto B = get<SegmentID<0, -1, LKMMSearchPolicy>>(Res);
+        auto *E = static_cast<SegmentID<1, 0, LKMMSearchPolicy> *>((*N)->Seg);
+
+        Res = SegmentID<0, 0, LKMMSearchPolicy>(B, *E);
+      }
+    }
+  }
+  return get<SegmentID<0,0,LKMMSearchPolicy>>(Res);
+}
+
+void SegmentGraph::enumeratePaths(size_t i, void (*AnnoFn)(const SegmentID<0,0, LKMMSearchPolicy> &Seg, const DepType Type, LKMMAnnotateDeps::DepMap *Result), DepType Type, LKMMAnnotateDeps::DepMap *Result) {
+  assert(i > 1 && "Path length must be at least 2");
+
+  for (auto *N : StartSet) {
+    SmallVector<SegmentNode*, 16> Path = { };
+    SmallVector<SegmentNode*, 16> WorkSet = { N };
+
+    SegmentNode *Pop = nullptr;
+
+    while (!WorkSet.empty()) {
+
+      auto *Curr = WorkSet.back();
+
+      if (Curr == Pop) {
+        WorkSet.pop_back();
+        goto pop;
+      }
+
+      Path.push_back(WorkSet.back());
+      WorkSet.pop_back();
+
+      if (Path.back()->E == 0) {
+        // We reached a leaf node, annotate the path
+        if (Path.front()->E == -1)
+          AnnoFn(mkSeg<-1>(Path), Type, Result);
+        else
+          AnnoFn(mkSeg<1>(Path), Type, Result);
+
+        goto pop;
+      }
+
+      if (Path.size() == i) goto pop;
+
+      WorkSet.push_back(Pop);
+      for (auto *S : Curr->Successors) {
+          WorkSet.push_back(S);
+      }
+      continue;
+
+    pop:
+      Path.pop_back();
+    }
+  }
+}
+
+
 // Try to find dependencies bottom-up.
 template <DepType DT>
 class BUCtx : public InstVisitor<BUCtx<DT>> {
@@ -709,10 +875,9 @@ public:
 
   // Merges all segments to full dependency chains of length Depth.
   void merge(const size_t &Depth) {
-    for (size_t D = 1; D <= Depth; D++)
-      buildTransitiveClosure(D);
+    buildTransitiveClosure(Depth);
 
-    removeDuplicates(*Result);
+    //removeDuplicates(*Result);
     DUMP();
     // for (auto I : *Result) {
     //   I.print();
@@ -817,6 +982,8 @@ public:
     FOR_EACH_DP(PRINT_DEPS)
 #undef PRINT_DEPS
 
+    NumCombined[this->Type][this->getKind()][1] = Result->size();
+
     StatCombined[this->Type][this->getKind()][0] = [](auto *R){ if (R->size() == 0) {return 0ul;}; size_t tmp = -1; for (const auto &Seg : *R) { tmp = std::min(tmp, Seg.getDC().Chain.size()); } return tmp; }(Result);
     StatCombined[this->Type][this->getKind()][1] = [](auto *R){ if (R->size() == 0) {return 0ul;}; size_t tmp = 0; for (const auto &Seg : *R) { tmp = std::max(tmp, Seg.getDC().Chain.size()); } return tmp; }(Result);
     StatCombined[this->Type][this->getKind()][2] = [](auto *R){ if (R->size() == 0) {return 0ul;}; size_t tmp = 0; for (const auto &Seg : *R) { tmp += Seg.getDC().Chain.size(); } return tmp/R->size(); }(Result);
@@ -859,7 +1026,7 @@ private:
 
   void buildTransitiveClosure(const size_t Depth);
   template<int B, int M, int E>
-  DepMap<B,E> match(DepMap<B, M> *Beg, DepMap<-M, E> *End);
+  std::vector<std::pair<SegmentID<B, M, LKMMSearchPolicy> *, SegmentID<-M, E, LKMMSearchPolicy> *>> match(DepMap<B, M> *Beg, DepMap<-M, E> *End);
 };
 
 /// Converts an LLVM IR level chain to a source level chain, and
@@ -881,6 +1048,10 @@ void LKMMAnnotateDepsPass::annotateChain(const SegmentID<0,0, LKMMSearchPolicy> 
       }
     }
 
+    auto AHash = std::hash<std::string>{}(Annot);
+    auto HashStr = std::to_string(AHash);
+    Pretty = HashStr + ":\n" + Pretty;
+
     std::string TyB;
     std::string TyE;
     switch (DT) {
@@ -899,22 +1070,30 @@ void LKMMAnnotateDepsPass::annotateChain(const SegmentID<0,0, LKMMSearchPolicy> 
     }
     {
       auto I = Seg.getDC().Chain.back();
-      MDNode *Meta = MDNode::get(I.Val->getContext(), MDString::get(I.Val->getContext(), Annot));
+      MDNode *Meta = MDNode::get(I.Val->getContext(), MDString::get(I.Val->getContext(), HashStr));
 
-      if (auto *Existing = I.Val->getMetadata(TyB))
-        Meta = llvm::MDNode::concatenate(Existing, Meta);
+      if (auto *Existing = I.Val->getMetadata(TyB)) {
+        if (Existing->getNumOperands() > MAX_CHAINS_PER_INST) {
+          errs() << "Warning: Instruction has too many dependency chains\n";
+        } else
+          Meta = llvm::MDNode::concatenate(Existing, Meta);
+      }
       I.Val->setMetadata(TyB, Meta);
     }
     {
       auto I = Seg.getDC().Chain.front();
-      MDNode *Meta = MDNode::get(I.Val->getContext(), MDString::get(I.Val->getContext(), Annot));
+      MDNode *Meta = MDNode::get(I.Val->getContext(), MDString::get(I.Val->getContext(), HashStr));
 
-      if (auto *Existing = I.Val->getMetadata(TyE))
-        Meta = llvm::MDNode::concatenate(Existing, Meta);
+      if (auto *Existing = I.Val->getMetadata(TyE)) {
+        if (Existing->getNumOperands() > MAX_CHAINS_PER_INST) {
+          errs() << "Warning: Instruction has too many dependency chains\n";
+        } else
+          Meta = llvm::MDNode::concatenate(Existing, Meta);
+      }
       I.Val->setMetadata(TyE, Meta);
     }
 
-    Ret.setStr(Pretty);
+    Ret.setStr(Pretty, DT);
     Result->push_back(Ret);
 }
 
@@ -945,23 +1124,30 @@ void LKMMVerifyDepsPass::addChain(const SegmentID<0,0, LKMMSearchPolicy> &Seg, c
     I->Val->setMetadata("addr_dep", Meta);
   }
   */
+  auto AHash = std::hash<std::string>{}(Annot);
+  auto HashStr = std::to_string(AHash);
+  Pretty = HashStr + ":\n" + Pretty;
 
-  Ret.setStr(Pretty);
+  Ret.setStr(Pretty, DT);
   Result->push_back(Ret);
 }
 
-template<DepType DT>
-template<int B, int M, int E>
-LKMMSearchPolicy::DepMap<B,E> LKMMSearchPolicy::AnnotCtx<DT>::match(DepMap<B, M> *Beg, DepMap<-M, E> *End) {
-  if (!Beg || !End)
-    return DepMap<B,E>();
+template <DepType DT>
+template <int B, int M, int E>
+std::vector<std::pair<SegmentID<B, M, LKMMSearchPolicy> *, SegmentID<-M, E, LKMMSearchPolicy> *>> LKMMSearchPolicy::AnnotCtx<DT>::match(DepMap<B, M> *Beg, DepMap<-M, E> *End) {
 
-  DepMap<B,E> Ret;
-  for (auto &EndSeg : *End) {
-    for (auto &BegSeg : *Beg) {
-      if (BegSeg.isCompatible(EndSeg)) {
-        Ret.push_back(SegmentID<B,E,LKMMSearchPolicy>(BegSeg, EndSeg));
-      }
+  if (!Beg || !End)
+    return {};
+
+  using RetTy = std::vector<std::pair<SegmentID<B, M, LKMMSearchPolicy> *, SegmentID<-M, E, LKMMSearchPolicy> *>>;
+
+  RetTy Ret;
+  for (auto It = End->begin(); It != End->end(); It++) {
+    auto Jt = Beg->begin();
+    while (Jt != Beg->end() && !(Jt->isCompatible(*It))) Jt++;
+    while (Jt != Beg->end() && Jt->isCompatible(*It)) {
+      Ret.push_back({&(*Jt), &(*It)});
+      Jt++;
     }
   }
 
@@ -972,82 +1158,62 @@ template<DepType DT>
 void LKMMSearchPolicy::AnnotCtx<DT>::buildTransitiveClosure(const size_t Depth) {
 
   LKMMAnnotateDeps::DepMap *IntactDeps = Result;
+  SegmentGraph G;
 
-  if (Depth == 1) {
-    // Depth 1: Trivial
-    for (auto &Seg : *I) {
-      AnnotateFn(Seg, DT, IntactDeps);
-    }
+
+  // Depth 1: Trivial and always needed
+  for (auto &Seg : *I) {
+    AnnotateFn(Seg, DT, IntactDeps);
+  }
+
+  if (Depth == 1)
     return;
-  }
 
-  if (Depth == 2) {
-    // Depth 2: Still trivial, concatenate all matching R/MR and MD/D pairs
-    auto DCs = match(MR, R);
-    for (auto &Seg : DCs) {
-      AnnotateFn(Seg, DT, IntactDeps);
-    }
+  // For all longer chain we build a graph
+  // Excluding I
+  for (auto &Seg : *R) G.addSegment(&Seg);
+  for (auto &Seg : *MD) G.addSegment(&Seg);
+  for (auto &Seg : *D) G.addSegment(&Seg);
+  for (auto &Seg : *MR) G.addSegment(&Seg);
+  for (auto &Seg : *RD) G.addSegment(&Seg);
+  for (auto &Seg : *MDD) G.addSegment(&Seg);
+  for (auto &Seg : *MRR) G.addSegment(&Seg);
+  for (auto &Seg : *MRMD) G.addSegment(&Seg);
 
-    DCs = match(D, MD);
-    for (auto &Seg : DCs) {
-      AnnotateFn(Seg, DT, IntactDeps);
-    }
-    return;
-  }
+#define MATCH_R(DP) do { \
+  for (auto &P : match(MR, DP)) { \
+    G.addEdge(P.first, P.second); \
+  } \
+  for (auto &P : match(MRR, DP)) { \
+    G.addEdge(P.first, P.second); \
+  } \
+  for (auto &P : match(MRMD, DP)) { \
+    G.addEdge(P.first, P.second); \
+  } \
+} while(0);
 
-  // We start with <X, 0> Chains of length 1
-  // We match all <Y, -X> with Y!=0 to <Y, 0> Chains of length 2
-  // Repeat until Depth-1
-  // Add <0, -Y> to complete the chains
-  auto PrevPos = std::make_unique<DepMap<1, 0>>();
-  auto PrevNeg = std::make_unique<DepMap<-1, 0>>();
-  auto CurPos = std::make_unique<DepMap<1, 0>>();
-  auto CurNeg = std::make_unique<DepMap<-1, 0>>();
-  size_t Len = 2;
+#define MATCH_MD(DP) do { \
+  for (auto &P : match(D, DP)) { \
+    G.addEdge(P.first, P.second); \
+  } \
+  for (auto &P : match(RD, DP)) { \
+    G.addEdge(P.first, P.second); \
+  } \
+  for (auto &P : match(MDD, DP)) { \
+    G.addEdge(P.first, P.second); \
+  } \
+} while(0);
 
-  for (auto &Seg : match(MRR, R)) {
-    PrevNeg->push_back(Seg);
-  }
-  for (auto &Seg : match(MRMD, R)) {
-    PrevPos->push_back(Seg);
-  }
-  for (auto &Seg : match(MDD, MD)) {
-    PrevPos->push_back(Seg);
-  }
-  for (auto &Seg : match(RD, MD)) {
-    PrevNeg->push_back(Seg);
-  }
+  FOR_RISING_DP(MATCH_R);
+  FOR_MAYDANGLE_DP(MATCH_MD);
 
-  // sort & remove duplicates ??
+#undef MATCH_R
+#undef MATCH_MD
 
-  // TODO: check for delta
-  while (Len < Depth-1) {
-    for (auto &Seg : match(MRR, PrevNeg.get())) {
-      CurNeg->push_back(Seg);
-    }
-    for (auto &Seg : match(MRMD, PrevNeg.get())) {
-      CurPos->push_back(Seg);
-    }
-    for (auto &Seg : match(MDD, PrevPos.get())) {
-      CurPos->push_back(Seg);
-    }
-    for (auto &Seg : match(RD, PrevPos.get())) {
-      CurNeg->push_back(Seg);
-    }
 
-    PrevNeg = std::move(CurNeg);
-    PrevPos = std::move(CurPos);
-    CurNeg = std::make_unique<DepMap<-1, 0>>();
-    CurPos = std::make_unique<DepMap<1, 0>>();
-    Len++;
-  }
+  G.enumeratePaths(Depth, AnnotateFn, DT, IntactDeps);
 
-  for (auto &Seg : match(MR, PrevNeg.get())) {
-      AnnotateFn(Seg, DT, IntactDeps);
-  }
-  for (auto &Seg : match(D, PrevPos.get())) {
-      AnnotateFn(Seg, DT, IntactDeps);
-  }
+  return;
 }
 
 template<DepType DT>
@@ -1076,23 +1242,30 @@ void BUCtx<DT>::handleBranch(BasicBlock *NextBB) {
     //                 +------------+
     //
 
-    // If there is a trivial path from one target
-    // to the current BB, we add the branch.
+    // [!] If there is a trivial path from one target
+    // [!] to the current BB, we add the branch.
 
-    for (auto *Succ : BI->successors()) {
-      if (!isPotentiallyReachable(Succ, CurrBB))
-        continue;
-      auto *T = Succ;
-      while (T != CurrBB) {
-        T = T->getUniqueSuccessor();
-        if (!T)
-          return;
-      }
+    // for (auto *Succ : BI->successors()) {
+    //   if (!isPotentiallyReachable(Succ, CurrBB))
+    //     continue;
+    //   auto *T = Succ;
+    //   while (T != CurrBB) {
+    //     T = T->getUniqueSuccessor();
+    //     if (!T)
+    //       return;
+    //   }
+    //   Ann->getDc().addLink(BI, DCLevel::EMPTY);
+    //   // There should be exactly one terminator for the next BB
+    //   return;
+    // }
+    // return;
+
+
+    // If CurrBB post-dominates NextBB, we add it.
+    // May be optimized to selects, which we also handle.
+    // If after optimization, the dominance changed, there might be a bug -- hence the link will miss
+    if (Ann->getPDT().dominates(CurrBB, NextBB))
       Ann->getDc().addLink(BI, DCLevel::EMPTY);
-      // There should be exactly one terminator for the next BB
-      return;
-    }
-    return;
   }
 }
 
@@ -1536,7 +1709,6 @@ template <DepType DT>
 void BUCtx<DT>::goThroughMem(LoadInst &LI) {
 
   auto *Ann = (LKMMSearchPolicy::AnnotCtx<DT> *)this;
-bool dbgLocEq(const DebugLoc &L, const DebugLoc &R);
 
   // TODO: Are double load/stores ok?
   // Sounds like aliasing
@@ -1832,6 +2004,7 @@ llvm::LKMMAnnotateDeps::DepMap *LKMMSearchPolicy::LKMMAnnotator::run(Module &M, 
     Depth--;
 
     for (auto &F : M) {
+      AC.setPDT(FAM.getResult<PostDominatorTreeAnalysis>(F));
       if constexpr (DT == DepType::CTRL) {
         //Annotate dependencies ending in nested calls.
         if (!F.hasFnAttribute(takes<DT>()))
@@ -1845,6 +2018,7 @@ llvm::LKMMAnnotateDeps::DepMap *LKMMSearchPolicy::LKMMAnnotator::run(Module &M, 
     }
 
     for (auto &F : M) {
+      AC.setPDT(FAM.getResult<PostDominatorTreeAnalysis>(F));
       if constexpr (DT == DepType::CTRL) {
         //Annotate dependencies ending in nested ends.
         if (!F.hasFnAttribute(takes<DT>()))
@@ -1862,11 +2036,13 @@ llvm::LKMMAnnotateDeps::DepMap *LKMMSearchPolicy::LKMMAnnotator::run(Module &M, 
       DataAC.populate(AC.getI(), AC.getR(), AC.getMD(), AC.getD(), AC.getRD(), AC.getMDD(), AC.getMR(), AC.getMRR(), AC.getMRMD());
       // We need to do this after both passTwo and passThree
       for (auto &F : M) {
+        DataAC.setPDT(FAM.getResult<PostDominatorTreeAnalysis>(F));
         if (!F.getAttributes().getRetAttrs().hasAttribute(returns<DepType::DATA>()))
           continue;
         DataAC.passTwo(&F);
       }
       for (auto &F : M) {
+        DataAC.setPDT(FAM.getResult<PostDominatorTreeAnalysis>(F));
         if (!F.hasFnAttribute(calls<DepType::DATA>()))
           continue;
         DataAC.passThree(&F);
@@ -1893,7 +2069,7 @@ void LKMMVerifyDepsPass::verifyChain(LKMMAnnotateDeps::DepMap *Pre, LKMMAnnotate
   auto Name = M.getModuleIdentifier();
   std::replace(Name.begin(), Name.end(), '/', '_');
   auto FileName = Prefix + "matched_chains_" + Name + ".txt";
-  auto Matches = raw_fd_ostream(FileName, EC, sys::fs::CreationDisposition::CD_CreateAlways);
+  auto Matches = raw_fd_ostream(FileName, EC, sys::fs::CreationDisposition::CD_OpenAlways, sys::fs::FileAccess::FA_Write, sys::fs::OpenFlags::OF_Append);
 
   for (auto &Seg : *Pre) {
 
@@ -1906,7 +2082,7 @@ void LKMMVerifyDepsPass::verifyChain(LKMMAnnotateDeps::DepMap *Pre, LKMMAnnotate
 
     if (It == Post->end()) {
       Matches << raw_fd_ostream::Colors::RED << "Missing chain for [1]:\n";
-      Matches << raw_fd_ostream::Colors::RESET << Seg.Pretty << "\n\n";
+      Matches << raw_fd_ostream::Colors::RESET << DepToStr(Seg.FinalizedAs) << ": " << Seg.Pretty << "\n\n";
       continue;
     }
 
@@ -1941,15 +2117,15 @@ void LKMMVerifyDepsPass::verifyChain(LKMMAnnotateDeps::DepMap *Pre, LKMMAnnotate
 
     if (!Matched) {
       Matches << raw_fd_ostream::Colors::RED << "Missing chain for [2]:\n";
-      Matches << raw_fd_ostream::Colors::RESET << Seg.Pretty << "\n\n";
+      Matches << raw_fd_ostream::Colors::RESET << DepToStr(Seg.FinalizedAs) << ": " << Seg.Pretty << "\n\n";
       continue;
     }
 
   //#ifdef LLVM_DEBUG
     Matches << raw_fd_ostream::Colors::GREEN << "Matched:\nPRE-OPT:\n";
-    Matches << raw_fd_ostream::Colors::RESET << Seg.Pretty;
+    Matches << raw_fd_ostream::Colors::RESET << DepToStr(Seg.FinalizedAs) << ": " << Seg.Pretty;
     Matches << raw_fd_ostream::Colors::GREEN << "\nPOST_OPT:\n";
-    Matches << raw_fd_ostream::Colors::RESET << Dbg->Pretty << "\n\n";
+    Matches << raw_fd_ostream::Colors::RESET << DepToStr(Seg.FinalizedAs) << ": " << Dbg->Pretty << "\n\n";
   //#endif
   }
 }
@@ -1963,28 +2139,31 @@ bool LKMMAnnotatePrimitives::getAtomicAnnot(StringRef Name, const StringRef **At
   *Attr = Ptr;
   return true;
 }
-bool LKMMAnnotatePrimitives::getPrimitiveAnnotB(StringRef Name, const StringRef **Attr) {
+bool LKMMAnnotatePrimitives::getPrimitiveAnnot(StringRef Name, const StringRef **Attr) {
 
-  auto *Ptr = find(Begins, Name);
-  if (Ptr == adl_end(Begins))
-    return false;
+  for (auto *It = adl_begin(Macros); It != adl_end(Macros); It++) {
+    if (std::strncmp(Name.data(), It->data(), It->size()) == 0) {
+      *Attr = It;
+      return true;
+    }
+  }
 
-  *Attr = Ptr;
-  return true;
+  return false;
 }
-bool LKMMAnnotatePrimitives::getPrimitiveAnnotE(StringRef Name, StringRef const **Attr) {
-
-  auto *Ptr = find(Ends, Name);
-  if (Ptr == adl_end(Ends))
-    return false;
-
-  *Attr = Ptr;
-  return true;
-}
+// bool LKMMAnnotatePrimitives::getPrimitiveAnnotE(StringRef Name, StringRef const **Attr) {
+// 
+//   auto *Ptr = find(Ends, Name);
+//   if (Ptr == adl_end(Ends))
+//     return false;
+// 
+//   *Attr = Ptr;
+//   return true;
+// }
 
 void LKMMAnnotatePrimitives::transform(Function &F) {
 
   bool InPrimitive = false;
+  SmallVector<const StringRef *, 3> Annotations;
 
   const StringRef *Annot = nullptr;
   for (auto &BB : F) {
@@ -1994,31 +2173,44 @@ void LKMMAnnotatePrimitives::transform(Function &F) {
         if (!Callee)
           goto isAsm;
 
-        if (getPrimitiveAnnotB(Callee->getName(), &Annot)) {
-          InPrimitive = true;
-          I = CI->eraseFromParent();
-        }
-        else if (getPrimitiveAnnotE(Callee->getName(), &Annot)) {
-          InPrimitive = false;
-          I = CI->eraseFromParent();
-          if (*Annot == "__depsan_ronce_e") {
-            if (auto *LI = dyn_cast<LoadInst>(I)) {
-              for ( size_t i = 0; i < 3; i++ ) {
-                I->addAnnotationMetadata("__depsan_ronce_b");
-                I++;
+        if (getPrimitiveAnnot(Callee->getName(), &Annot)) {
+          auto *It = std::find(Annotations.begin(), Annotations.end(), Annot);
+          if (It != Annotations.end()) {
+            // _e annotation hopefully
+            I = CI->eraseFromParent();
+            if (*Annot == "__depsan_ronce") {
+              if (auto *LI = dyn_cast<LoadInst>(I)) {
+                auto J = I;
+                for ( size_t i = 0; i < 3; i++, J++) {
+                    MDNode *Meta = MDNode::get((J)->getContext(), MDString::get(J->getContext(), *Annot));
+                    MDNode *Existing = J->getMetadata(LLVMContext::MD_lkmm_primitive);
+                    if (Existing)
+                      Meta = MDNode::concatenate(Existing, Meta);
+                    J->setMetadata(LLVMContext::MD_lkmm_primitive, Meta);
+                }
+              } else {
+                errs() << "[WARN] READ_ONCE does not end in a load\n";
               }
             }
-            else {
-              errs() << "[WARN] READ_ONCE does not end in a load\n";
-            }
+            Annotations.erase(It);
+            Annot = nullptr;
+          } else {
+            // _b annotation hopefully
+            Annotations.push_back(Annot);
+            I = CI->eraseFromParent();
           }
-          Annot = nullptr;
         }
       }
 isAsm:
-      if (InPrimitive) {
-        assert(Annot && "Missing annotation");
-        I->addAnnotationMetadata(*Annot);
+      if (!Annotations.empty()) {
+        //assert(Annot && "Missing annotation");
+        for (auto *Annot : Annotations) {
+          MDNode *Meta = MDNode::get(I->getContext(), MDString::get(I->getContext(), *Annot));
+          MDNode *Existing = I->getMetadata(LLVMContext::MD_lkmm_primitive);
+          if (Existing)
+            Meta = MDNode::concatenate(Existing, Meta);
+          I->setMetadata(LLVMContext::MD_lkmm_primitive, Meta);
+        }
       }
     }
   }
@@ -2077,6 +2269,8 @@ PreservedAnalyses LKMMVerifyDepsPass::run(Module &M,
   auto FileName = Prefix + "Mod_" + Name + ".ll2";
   auto Opt = raw_fd_ostream(FileName, EC, sys::fs::CreationDisposition::CD_CreateAlways);
 
+  auto StatName = Prefix + "Stat_" + Name + ".json";
+  auto Stat = raw_fd_ostream(StatName, EC, sys::fs::CreationDisposition::CD_CreateAlways);
   {
     auto A = LKMMSearchPolicy::LKMMAnnotator(CK_Ver, &addChain, &Annotations);
     verifyChain(Annotations.IntactDeps[(int)DepType::ADDR], A.run<DepType::ADDR>(M, AM), M);
@@ -2088,6 +2282,7 @@ PreservedAnalyses LKMMVerifyDepsPass::run(Module &M,
 
   errs() << "\n^^^^^~~~~~~~~~ LKMMVerifyDepsPass ~~~~~^^^^^\n";
 
+  PrintStatisticsJSON(Stat);
   return PreservedAnalyses::all();
 }
 
@@ -2098,7 +2293,8 @@ PreservedAnalyses LKMMVerifyDepsPass::run(Module &M,
 static void annotateAllRec(Function &F, const StringRef &Annot) {
   for (auto &BB : F) {
     for (auto &I : BB) {
-      I.addAnnotationMetadata(Annot);
+      MDNode *Meta = MDNode::get(I.getContext(), MDString::get(I.getContext(), Annot));
+      I.setMetadata(LLVMContext::MD_lkmm_primitive, Meta);
       if (auto *CI = dyn_cast<CallInst>(&I)) {
         if (!CI->getCalledFunction())
           continue;
@@ -2120,7 +2316,15 @@ PreservedAnalyses LKMMAnnotatePrimitives::run(Module &M,
     const StringRef *Annot = nullptr;
     if (getAtomicAnnot(F.getName(), &Annot)) {
       annotateAllRec(F, *Annot);
-      continue;
+      for (auto *U : F.users()) {
+        if (auto *CI = dyn_cast<CallInst>(U)) {
+          MDNode *Meta = MDNode::get(CI->getContext(), MDString::get(CI->getContext(), *Annot));
+          MDNode *Existing = CI->getMetadata(LLVMContext::MD_lkmm_primitive);
+          if (Existing)
+            Meta = MDNode::concatenate(Existing, Meta);
+          CI->setMetadata(LLVMContext::MD_lkmm_primitive, Meta);
+        }
+      }
     }
 
     transform(F);

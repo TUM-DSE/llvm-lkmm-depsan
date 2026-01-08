@@ -332,7 +332,7 @@ public:
   }
 
   void makePretty();
-  void setStr(const std::string &Str) { Pretty = Str; }
+  void setStr(const std::string &Str ,const DepType DT) { Pretty = Str; FinalizedAs = DT;}
   void print() { errs() << Pretty << "\n\n"; };
 
   // TODO: string_view?
@@ -348,6 +348,7 @@ public:
   const DC<C> &getDC() const { return Dc; }
   static constexpr std::string_view Type = SegmentType<B, E>::Type;
   std::string Pretty;
+  DepType FinalizedAs;
 
 private:
   DC<C> Dc;
@@ -444,6 +445,36 @@ public:
   class AnnotCtx;
 
   class LKMMAnnotator;
+};
+
+class SegmentNode {
+public:
+  void *Seg;
+  int B, E;
+  std::vector<SegmentNode *> Successors;
+
+  template<int SB, int SE, typename C>
+  SegmentNode(SegmentID<SB,SE,C> *S) : Seg((void*)S), B(SB), E(SE) {};
+};
+
+// Directed (cyclic) graph of segments
+// Edges exist only iff two segments match at function boundaries
+class SegmentGraph {
+public:
+  template<int B, int E, typename C>
+  void addSegment(SegmentID<B,E,C> *Seg);
+
+  template<int B, int E, typename C>
+  SegmentNode* getSegmentNode(SegmentID<B,E,C> *Seg);
+
+  template<int B, int M, int E, typename C>
+  void addEdge(SegmentID<B,M,C> *From, SegmentID<-M,E,C> *To);
+
+  void enumeratePaths(size_t i, void (*AnnoFn)(const SegmentID<0,0, LKMMSearchPolicy> &Seg, const DepType Type, LKMMAnnotateDeps::DepMap *Result), DepType Type, LKMMAnnotateDeps::DepMap *Result);
+
+private:
+  std::vector<std::unique_ptr<SegmentNode>> Nodes;
+  std::vector<SegmentNode*> StartSet;
 };
 
 //===----------------------------------------------------------------------===//
@@ -584,38 +615,47 @@ public:
     "atomic_long_dec_and_test",
     "atomic_long_inc_and_test",
     "atomic_long_add_negative",
+
+    "rcu_read_lock",
+    "rcu_read_unlock",
   };
 
-  constexpr static StringRef Begins[] = {
-    "__depsan_mb_b",
-    "__depsan_rmb_b",
-    "__depsan_wmb_b",
-    "__depsan_release_b",
-    "__depsan_acquire_b",
-    "__depsan_atomic_b",
-    "__depsan_ronce_b",
-    "__depsan_wonce_b",
-    "__depsan_lock_b",
-    "__depsan_unlock_b"
+  constexpr static StringRef Macros[] = {
+    "__depsan_mb",
+    "__depsan_rmb",
+    "__depsan_wmb",
+    "__depsan_release",
+    "__depsan_acquire",
+    "__depsan_atomic",
+    "__depsan_ronce",
+    "__depsan_wonce",
+    "__depsan_lock",
+    "__depsan_unlock",
+    "__depsan_rcu_deref",
+    "__depsan_rcu_assign",
+    "__depsan_rcu_sync",
   };
-  constexpr static StringRef Ends[] = {
-    "__depsan_mb_e",
-    "__depsan_rmb_e",
-    "__depsan_wmb_e",
-    "__depsan_release_e",
-    "__depsan_acquire_e",
-    "__depsan_atomic_e",
-    "__depsan_ronce_e",
-    "__depsan_wonce_e",
-    "__depsan_lock_e",
-    "__depsan_unlock_e"
-  };
+  //constexpr static StringRef Ends[] = {
+  //  "__depsan_mb_e",
+  //  "__depsan_rmb_e",
+  //  "__depsan_wmb_e",
+  //  "__depsan_release_e",
+  //  "__depsan_acquire_e",
+  //  "__depsan_atomic_e",
+  //  "__depsan_ronce_e",
+  //  "__depsan_wonce_e",
+  //  "__depsan_lock_e",
+  //  "__depsan_unlock_e",
+  //  "__depsan_rcu_deref_e",
+  //  "__depsan_rcu_assign_e",
+  //  "__depsan_rcu_sync_e",
+  //};
 
 private:
   void transform(Function &F);
   bool getAtomicAnnot(StringRef Name, const StringRef **Attr);
-  bool getPrimitiveAnnotB(StringRef Name, const StringRef **Attr);
-  bool getPrimitiveAnnotE(StringRef Name, const StringRef **Attr);
+  bool getPrimitiveAnnot(StringRef Name, const StringRef **Attr);
+  //bool getPrimitiveAnnotE(StringRef Name, const StringRef **Attr);
 };
 
 //===----------------------------------------------------------------------===//

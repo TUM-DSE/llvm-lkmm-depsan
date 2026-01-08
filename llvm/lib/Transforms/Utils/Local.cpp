@@ -3297,7 +3297,18 @@ static void combineMetadata(Instruction *K, const Instruction *J,
     // TODO: Assert that this switch is exhaustive for fixed MD kinds.
     switch (Kind) {
       default:
+        if ((Kind == J->getContext().getMDKindID("begins_addr_dep")) ||
+            (Kind == J->getContext().getMDKindID("ends_addr_dep")) ||
+            (Kind == J->getContext().getMDKindID("begins_data_dep")) ||
+            (Kind == J->getContext().getMDKindID("ends_data_dep")) ||
+            (Kind == J->getContext().getMDKindID("begins_ctrl_dep")) ||
+            (Kind == J->getContext().getMDKindID("ends_ctrl_dep")) ) {
+          K->setMetadata(Kind, MDNode::concatenate(KMD, JMD));
+          break;
+        }
         K->setMetadata(Kind, nullptr); // Remove unknown metadata
+        break;
+      case LLVMContext::MD_lkmm_primitive:
         break;
       case LLVMContext::MD_dbg:
         llvm_unreachable("getAllMetadataOtherThanDebugLoc returned a MD_dbg");

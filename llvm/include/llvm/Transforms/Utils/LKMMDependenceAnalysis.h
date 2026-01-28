@@ -354,8 +354,13 @@ private:
   DC<C> Dc;
 };
 
-//static_assert(std::is_move_constructible_v<SegmentID<0,0,llvm::LKMMAnnotateDeps>>);
-//static_assert(std::is_nothrow_move_constructible_v<SegmentID<0,0,llvm::LKMMAnnotateDeps>>);
+//===----------------------------------------------------------------------===//
+// Function Reachability Analysis and Module Extraction
+//===----------------------------------------------------------------------===//
+void saveMiniModule(Function *F, const std::string &OutDir, const std::string &Suffix);
+
+std::set<Function *> getReachableFunctions(Function *F);
+std::set<GlobalVariable *> getReachableGlobals(std::set<Function *> &Funcs);
 
 //===----------------------------------------------------------------------===//
 // Some helper functions
@@ -618,14 +623,21 @@ public:
 
     "rcu_read_lock",
     "rcu_read_unlock",
+    "synchronize_rcu",
+
+    "spin_lock",
+    "spin_unlock",
   };
 
   constexpr static StringRef Macros[] = {
     "__depsan_mb",
     "__depsan_rmb",
     "__depsan_wmb",
-    "__depsan_release",
-    "__depsan_acquire",
+    "__depsan_mb_ba",
+    "__depsan_mb_aa",
+    "__depsan_barrier",
+    "__depsan_s_release",
+    "__depsan_l_acquire",
     "__depsan_atomic",
     "__depsan_ronce",
     "__depsan_wonce",
@@ -654,7 +666,7 @@ public:
 private:
   void transform(Function &F);
   bool getAtomicAnnot(StringRef Name, const StringRef **Attr);
-  bool getPrimitiveAnnot(StringRef Name, const StringRef **Attr);
+  bool getPrimitiveAnnot(StringRef Name, StringRef *Attr);
   //bool getPrimitiveAnnotE(StringRef Name, const StringRef **Attr);
 };
 

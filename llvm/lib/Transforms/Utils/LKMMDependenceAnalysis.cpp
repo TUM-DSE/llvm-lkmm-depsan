@@ -24,8 +24,10 @@
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Analysis/CFG.h"
+#include "llvm/Analysis/CallGraph.h"
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/PostDominators.h"
+#include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/IR/AttributeMask.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/CFG.h"
@@ -49,6 +51,7 @@
 #include <chrono>
 #include <format>
 #include <variant>
+#include <iterator>
 
 #define DEBUG_TYPE "lkmm-dep-analyzer"
 
@@ -186,6 +189,229 @@ static bool Exiting = false;
 static std::string Prefix = "LKMM-Def-Out/";
 
 namespace llvm {
+// Almost the same as llvm::CloneModule, except we only clone reachable functions and used globals
+static void copyComdat(GlobalObject *Dst, const GlobalObject *Src) {
+  const Comdat *SC = Src->getComdat();
+  if (!SC)
+    return;
+  Comdat *DC = Dst->getParent()->getOrInsertComdat(SC->getName());
+  DC->setSelectionKind(SC->getSelectionKind());
+  Dst->setComdat(DC);
+}
+
+void saveMiniModule(Function *F, const std::string &OutDir, const std::string &Suffix) {
+
+  Module *M = F->getParent();
+  assert(M->isMaterialized() && "Module must be materialized before cloning!");
+
+  std::set<Function *> ReachableFs = getReachableFunctions(F);
+  std::set<GlobalVariable *> ReachableGvs = getReachableGlobals(ReachableFs);
+
+  auto VMap = ValueMap<const Value *, WeakTrackingVH>();
+
+  // First off, we need to create the new module.
+  std::unique_ptr<Module> New =
+      std::make_unique<Module>(M->getModuleIdentifier(), M->getContext());
+  New->setSourceFileName(M->getSourceFileName());
+  New->setDataLayout(M->getDataLayout());
+  New->setTargetTriple(M->getTargetTriple());
+  New->setModuleInlineAsm(M->getModuleInlineAsm());
+
+  // Loop over all of the global variables, making corresponding globals in the
+  // new module.  Here we add them to the VMap and to the new Module.  We
+  // don't worry about attributes or initializers, they will come later.
+  //
+  for (GlobalVariable *I : ReachableGvs) {
+    GlobalVariable *NewGV = new GlobalVariable(
+        *New, I->getValueType(), I->isConstant(), I->getLinkage(),
+        (Constant *)nullptr, I->getName(), (GlobalVariable *)nullptr,
+        I->getThreadLocalMode(), I->getType()->getAddressSpace());
+    NewGV->copyAttributesFrom(I);
+    VMap[I] = NewGV;
+  }
+
+  // Loop over the functions in the module, making external functions as before
+  for (Function *I : ReachableFs) {
+    Function *NF =
+        Function::Create(cast<FunctionType>(I->getValueType()), I->getLinkage(),
+                         I->getAddressSpace(), I->getName(), New.get());
+    NF->copyAttributesFrom(I);
+    VMap[I] = NF;
+  }
+
+  // Loop over the aliases in the module
+  for (const GlobalAlias &I : M->aliases()) {
+    auto *GA = GlobalAlias::create(I.getValueType(),
+                                   I.getType()->getPointerAddressSpace(),
+                                   I.getLinkage(), I.getName(), New.get());
+    GA->copyAttributesFrom(&I);
+    VMap[&I] = GA;
+  }
+
+  for (const GlobalIFunc &I : M->ifuncs()) {
+    // Defer setting the resolver function until after functions are cloned.
+    auto *GI =
+        GlobalIFunc::create(I.getValueType(), I.getAddressSpace(),
+                            I.getLinkage(), I.getName(), nullptr, New.get());
+    GI->copyAttributesFrom(&I);
+    VMap[&I] = GI;
+  }
+
+  // Similarly, copy over function bodies now...
+  //
+  for (const Function *I : ReachableFs) {
+    Function *F = cast<Function>(VMap[I]);
+
+    if (I->isDeclaration()) {
+      // Copy over metadata for declarations since we're not doing it below in
+      // CloneFunctionInto().
+      SmallVector<std::pair<unsigned, MDNode *>, 1> MDs;
+      I->getAllMetadata(MDs);
+      for (auto MD : MDs)
+        F->addMetadata(MD.first, *MapMetadata(MD.second, VMap));
+      continue;
+    }
+
+    Function::arg_iterator DestI = F->arg_begin();
+    for (const Argument &J : I->args()) {
+      DestI->setName(J.getName());
+      VMap[&J] = &*DestI++;
+    }
+
+    SmallVector<ReturnInst *, 8> Returns; // Ignore returns cloned.
+    CloneFunctionInto(F, I, VMap, CloneFunctionChangeType::ClonedModule,
+                      Returns);
+
+    if (I->hasPersonalityFn())
+      F->setPersonalityFn(MapValue(I->getPersonalityFn(), VMap));
+
+    copyComdat(F, I);
+  }
+
+  // And aliases
+  for (const GlobalAlias &I : M->aliases()) {
+    // We already dealt with undefined aliases above.
+    GlobalAlias *GA = cast<GlobalAlias>(VMap[&I]);
+    if (const Constant *C = I.getAliasee())
+      GA->setAliasee(MapValue(C, VMap));
+  }
+
+  for (const GlobalIFunc &I : M->ifuncs()) {
+    GlobalIFunc *GI = cast<GlobalIFunc>(VMap[&I]);
+    if (const Constant *Resolver = I.getResolver())
+      GI->setResolver(MapValue(Resolver, VMap));
+  }
+
+  // And named metadata....
+  for (const NamedMDNode &NMD : M->named_metadata()) {
+    NamedMDNode *NewNMD = New->getOrInsertNamedMetadata(NMD.getName());
+    for (const MDNode *N : NMD.operands())
+      NewNMD->addOperand(MapMetadata(N, VMap));
+  }
+
+  // Now that all of the things that global variable initializer can refer to
+  // have been created, loop through and copy the global variable referrers
+  // over...  We also set the attributes on the global now.
+  //
+  for (const GlobalVariable *G : ReachableGvs) {
+    GlobalVariable *GV = cast<GlobalVariable>(VMap[G]);
+
+    SmallVector<std::pair<unsigned, MDNode *>, 1> MDs;
+    G->getAllMetadata(MDs);
+    for (auto MD : MDs)
+      GV->addMetadata(MD.first, *MapMetadata(MD.second, VMap));
+
+    if (G->isDeclaration())
+      continue;
+
+    if (G->hasInitializer())
+      GV->setInitializer(MapValue(G->getInitializer(), VMap));
+
+    copyComdat(GV, G);
+  }
+
+  std::error_code EC;
+  auto OutPath = OutDir + "/" + F->getName().str();
+  auto ec = sys::fs::create_directories(OutPath);
+  if (ec) {
+    errs() << "Could not create output directory: " << ec.message() << "\n";
+    return;
+  }
+  raw_fd_ostream Out(OutPath + "/Mod.ll" + Suffix, EC, sys::fs::OF_None);
+  if (EC) {
+    errs() << "Could not open file: " << EC.message() << "\n";
+    return;
+  }
+
+  Out << *New;
+}
+
+std::set<Function *> getReachableFunctions(Function *F) {
+  std::set<Function *> Out;
+
+  std::set<Function *> WorkSet;
+  WorkSet.insert(F);
+  while (!WorkSet.empty()) {
+    auto It = WorkSet.begin();
+    Function *CurrF = *It;
+    WorkSet.erase(It);
+
+    if (Out.find(CurrF) != Out.end())
+      continue;
+
+    Out.insert(CurrF);
+
+    for (auto &BB : *CurrF) {
+      for (auto &I : BB) {
+        if (auto *CI = dyn_cast<CallInst>(&I)) {
+          if (Function *CalleeF = CI->getCalledFunction()) {
+            if (CalleeF->isDeclaration())
+              continue;
+            WorkSet.insert(CalleeF);
+          }
+        }
+      }
+    }
+  }
+
+  return Out;
+}
+std::set<GlobalVariable *> getReachableGlobals(std::set<Function *> &Fs) {
+  std::set<GlobalVariable *> Out;
+
+  for (auto *F : Fs) {
+    for (auto &BB : *F) {
+      for (auto &I : BB) {
+        for (auto &Op : I.operands()) {
+          if (auto *GV = dyn_cast<GlobalVariable>(Op)) {
+            Out.insert(GV);
+            if (!GV->hasInitializer())
+              continue;
+            if (auto *CA = dyn_cast<ConstantArray>(GV->getInitializer())) {
+              for (Use &Op : CA->operands()) {
+                if (auto *NGV = dyn_cast<GlobalVariable>(Op)) {
+                  Out.insert(NGV);
+                }
+                if (auto *F = dyn_cast<Function>(Op)) {
+                  if (F->isDeclaration())
+                    continue;
+                  Fs.insert(F);
+                }
+              }
+            }
+            if (auto *CV = dyn_cast<GlobalVariable>(GV->getInitializer())) {
+              Out.insert(CV);
+            }
+            if (auto *F = dyn_cast<Function>(Op)) {
+              Fs.insert(F);
+            }
+          }
+        }
+      }
+    }
+  }
+  return Out;
+}
 
 std::string getInstLocString(Instruction *I, bool ViaFile) {
   const DebugLoc &InstDebugLoc = I->getDebugLoc();
@@ -465,22 +691,31 @@ DC<LKMMSearchPolicy>::DC(const DC &Beg, const DC &End, int Delta) {
 
   // keep in mind that the chains are in reverse order
   auto It = Chain.insert(Chain.begin(), End.Chain.begin(), End.Chain.end());
+  auto Tmp = Chain.back().getDepth();
+  bool AdjBeg = false;
   // Chain: [End.E, ...., End.B]
   if (Delta > 0) {
-    for (auto &I = It; I != Chain.end(); I++) {
-      I->addDepth(Delta);
+    if (Tmp != 0) {
+      assert(Tmp-Delta >= 0 && "Incompatible chains for concatenation");
+      // adjust depth of Beg after insertion
+      AdjBeg = true;
+    } else {
+      // indent entire End chain right
+      for (auto &I = It; I != Chain.end(); I++) {
+        I->addDepth(Delta);
+      }
     }
   }
 
-  auto Tmp = Chain.back().getDepth();
-
   It = Chain.insert(Chain.end(), Beg.Chain.begin(), Beg.Chain.end());
   // Chain: [End.E, ...., End.B, Beg.E, ...., Beg.B]
-  if (Delta < 0) {
+  if (Delta < 0 || AdjBeg) {
+    // We know Tmp hasn't changed
     for (auto &I = It; I != Chain.end(); I++) {
       I->addDepth(Tmp-Delta);
     }
   }
+
   ArgB = Beg.ArgB;
   ArgE = End.ArgE;
 }
@@ -501,6 +736,7 @@ DC<LKMMAnnotateDeps>::DC(const DC<LKMMSearchPolicy> &Other) {
 
   // Dbg locations in macro expansions are a bit weird, they might not be unique.
   assert(Chain.size() > 0 && "Attempting to copy a chain with less than 2 links");
+
   ArgB = Other.ArgB;
   ArgE = Other.ArgE;
 }
@@ -1039,9 +1275,20 @@ void LKMMAnnotateDepsPass::annotateChain(const SegmentID<0,0, LKMMSearchPolicy> 
     llvm::SegmentID<0,0,LKMMAnnotateDeps> Ret(Seg);
     assert(!Ret.getDC().Chain.empty() && "Cannot annotate empty chain");
 
+    Function *TopF = nullptr;
+    for (auto L : Seg.getDC().Chain) {
+      if (L.getDepth() == 0) {
+        TopF = L.Val->getFunction();
+        break;
+      }
+    }
+
     for (auto I = Ret.getDC().Chain.crbegin(); I != Ret.getDC().Chain.crend(); I++) {
       Annot += getInstLocString(I->F, I->Loc.value());
-      Pretty += std::string(I->getDepth(), '\t') + getInstLocString(I->F, I->Loc.value());
+      std::string Mark = "";
+      if (TopF && (TopF->getName() == I->F)) Mark = "[T]";
+
+      Pretty += std::string(I->getDepth(), '\t') + Mark + getInstLocString(I->F, I->Loc.value());
       if (I != std::prev(Ret.getDC().Chain.crend())) {
         Annot += "--";
         Pretty += "\n";
@@ -1092,6 +1339,9 @@ void LKMMAnnotateDepsPass::annotateChain(const SegmentID<0,0, LKMMSearchPolicy> 
       }
       I.Val->setMetadata(TyE, Meta);
     }
+    if (TopF) {
+      TopF->addFnAttr(Attribute::get(TopF->getContext(), "is_entry"));
+    }
 
     Ret.setStr(Pretty, DT);
     Result->push_back(Ret);
@@ -1106,9 +1356,19 @@ void LKMMVerifyDepsPass::addChain(const SegmentID<0,0, LKMMSearchPolicy> &Seg, c
   llvm::SegmentID<0,0,LKMMAnnotateDeps> Ret(Seg);
   assert(!Ret.getDC().Chain.empty() && "Cannot annotate empty chain");
 
+  Function *TopF = nullptr;
+  for (auto L : Seg.getDC().Chain) {
+    if (L.getDepth() == 0) {
+      TopF = L.Val->getFunction();
+      break;
+    }
+  }
+
   for (auto I = Ret.getDC().Chain.crbegin(); I != Ret.getDC().Chain.crend(); I++) {
     Annot += getInstLocString(I->F, I->Loc.value());
-    Pretty += std::string(I->getDepth(), '\t') + getInstLocString(I->F, I->Loc.value());
+    std::string Mark = "";
+    if (TopF && (TopF->getName() == I->F)) Mark = "[T]";
+    Pretty += std::string(I->getDepth(), '\t') + Mark + getInstLocString(I->F, I->Loc.value());
     if (I != std::prev(Ret.getDC().Chain.crend())) {
       Annot += "--";
       Pretty += "\n";
@@ -2067,9 +2327,17 @@ void LKMMVerifyDepsPass::verifyChain(LKMMAnnotateDeps::DepMap *Pre, LKMMAnnotate
 
   auto EC = std::error_code();
   auto Name = M.getModuleIdentifier();
-  std::replace(Name.begin(), Name.end(), '/', '_');
-  auto FileName = Prefix + "matched_chains_" + Name + ".txt";
-  auto Matches = raw_fd_ostream(FileName, EC, sys::fs::CreationDisposition::CD_OpenAlways, sys::fs::FileAccess::FA_Write, sys::fs::OpenFlags::OF_Append);
+  std::replace(Name.begin(), Name.end(), '/', '-');
+  Name = Name.substr(0, Name.length()-2);
+
+  auto ModDir = Prefix + Name + "/";
+  auto e = sys::fs::is_directory(ModDir);
+  if (!e) {
+    errs() << "Not a directory [verify]: " << ModDir << "\n";
+  }
+
+  auto FileName = "matched_chains.txt";
+  auto Matches = raw_fd_ostream(ModDir + FileName, EC, sys::fs::CreationDisposition::CD_OpenAlways, sys::fs::FileAccess::FA_Write, sys::fs::OpenFlags::OF_Append);
 
   for (auto &Seg : *Pre) {
 
@@ -2139,11 +2407,11 @@ bool LKMMAnnotatePrimitives::getAtomicAnnot(StringRef Name, const StringRef **At
   *Attr = Ptr;
   return true;
 }
-bool LKMMAnnotatePrimitives::getPrimitiveAnnot(StringRef Name, const StringRef **Attr) {
+bool LKMMAnnotatePrimitives::getPrimitiveAnnot(StringRef Name, StringRef *Attr) {
 
   for (auto *It = adl_begin(Macros); It != adl_end(Macros); It++) {
     if (std::strncmp(Name.data(), It->data(), It->size()) == 0) {
-      *Attr = It;
+      *Attr = Name.drop_back(2);
       return true;
     }
   }
@@ -2163,9 +2431,9 @@ bool LKMMAnnotatePrimitives::getPrimitiveAnnot(StringRef Name, const StringRef *
 void LKMMAnnotatePrimitives::transform(Function &F) {
 
   bool InPrimitive = false;
-  SmallVector<const StringRef *, 3> Annotations;
+  SmallVector<StringRef, 3> Annotations;
 
-  const StringRef *Annot = nullptr;
+  StringRef Annot;
   for (auto &BB : F) {
     for (auto I = BB.begin(); I != BB.end(); I++ ) {
       if (auto *CI = dyn_cast<CallInst>(I)) {
@@ -2178,11 +2446,11 @@ void LKMMAnnotatePrimitives::transform(Function &F) {
           if (It != Annotations.end()) {
             // _e annotation hopefully
             I = CI->eraseFromParent();
-            if (*Annot == "__depsan_ronce") {
+            if (Annot == "__depsan_ronce") {
               if (auto *LI = dyn_cast<LoadInst>(I)) {
                 auto J = I;
                 for ( size_t i = 0; i < 3; i++, J++) {
-                    MDNode *Meta = MDNode::get((J)->getContext(), MDString::get(J->getContext(), *Annot));
+                    MDNode *Meta = MDNode::get((J)->getContext(), MDString::get(J->getContext(), Annot));
                     MDNode *Existing = J->getMetadata(LLVMContext::MD_lkmm_primitive);
                     if (Existing)
                       Meta = MDNode::concatenate(Existing, Meta);
@@ -2193,7 +2461,7 @@ void LKMMAnnotatePrimitives::transform(Function &F) {
               }
             }
             Annotations.erase(It);
-            Annot = nullptr;
+            Annot = StringRef();
           } else {
             // _b annotation hopefully
             Annotations.push_back(Annot);
@@ -2204,8 +2472,8 @@ void LKMMAnnotatePrimitives::transform(Function &F) {
 isAsm:
       if (!Annotations.empty()) {
         //assert(Annot && "Missing annotation");
-        for (auto *Annot : Annotations) {
-          MDNode *Meta = MDNode::get(I->getContext(), MDString::get(I->getContext(), *Annot));
+        for (auto Annot : Annotations) {
+          MDNode *Meta = MDNode::get(I->getContext(), MDString::get(I->getContext(), Annot));
           MDNode *Existing = I->getMetadata(LLVMContext::MD_lkmm_primitive);
           if (Existing)
             Meta = MDNode::concatenate(Existing, Meta);
@@ -2227,14 +2495,22 @@ LKMMAnnotateDeps LKMMAnnotateDepsPass::run(Module &M,
 
   auto EC = std::error_code();
   auto Name = M.getModuleIdentifier();
-  std::replace(Name.begin(), Name.end(), '/', '_');
-  auto FileName = Prefix + "Pre_Segments_" + Name + ".txt";
-  sys::fs::openFileForWrite(FileName, OutFD[0], sys::fs::CreationDisposition::CD_CreateAlways, sys::fs::OF_None);
-  FileName = Prefix + "Post_Segments_" + Name + ".txt";
-  sys::fs::openFileForWrite(FileName, OutFD[1], sys::fs::CreationDisposition::CD_CreateAlways, sys::fs::OF_None);
-  FileName = Prefix + "Mod_" + Name + ".ll1";
-  auto Opt = raw_fd_ostream(FileName, EC, sys::fs::CreationDisposition::CD_CreateAlways);
+  std::replace(Name.begin(), Name.end(), '/', '-');
+  Name = Name.substr(0, Name.length()-2);
 
+  auto ModDir = Prefix + Name + "/";
+  auto ec = sys::fs::create_directories(ModDir);
+  if (ec) {
+    errs() << "Error creating directory " << ModDir << ": " << ec.message() << "\n";
+  }
+
+  std::string FileName = "Pre_Segments.txt";
+  sys::fs::openFileForWrite(ModDir + FileName, OutFD[0], sys::fs::CreationDisposition::CD_CreateAlways, sys::fs::OF_None);
+  FileName = "Post_Segments_.txt";
+  sys::fs::openFileForWrite(ModDir + FileName, OutFD[1], sys::fs::CreationDisposition::CD_CreateAlways, sys::fs::OF_None);
+
+  FileName = "Mod_full.ll1";
+  auto Opt = raw_fd_ostream(ModDir + FileName, EC, sys::fs::CreationDisposition::CD_CreateAlways);
 
   LKMMAnnotateDeps Ret;
 
@@ -2246,6 +2522,11 @@ LKMMAnnotateDeps LKMMAnnotateDepsPass::run(Module &M,
   }
 
   Opt << M;
+  for (auto &F : M) {
+    if (F.hasFnAttribute("is_entry"))
+      saveMiniModule(&F, ModDir, "1");
+  }
+
   return Ret;
 }
 
@@ -2265,12 +2546,19 @@ PreservedAnalyses LKMMVerifyDepsPass::run(Module &M,
 
   auto EC = std::error_code();
   auto Name = M.getModuleIdentifier();
-  std::replace(Name.begin(), Name.end(), '/', '_');
-  auto FileName = Prefix + "Mod_" + Name + ".ll2";
-  auto Opt = raw_fd_ostream(FileName, EC, sys::fs::CreationDisposition::CD_CreateAlways);
+  std::replace(Name.begin(), Name.end(), '/', '-');
+  Name = Name.substr(0, Name.length()-2);
+  auto ModDir = Prefix + Name + "/";
+  auto e = sys::fs::is_directory(ModDir);
+  if (!e) {
+    errs() << "Not a directory: " << ModDir << "\n";
+  }
 
-  auto StatName = Prefix + "Stat_" + Name + ".json";
-  auto Stat = raw_fd_ostream(StatName, EC, sys::fs::CreationDisposition::CD_CreateAlways);
+  auto FileName = "Mod_full.ll2";
+  auto Opt = raw_fd_ostream(ModDir + FileName, EC, sys::fs::CreationDisposition::CD_CreateAlways);
+
+  auto StatName = "Stats.json";
+  auto Stat = raw_fd_ostream(ModDir + StatName, EC, sys::fs::CreationDisposition::CD_CreateAlways);
   {
     auto A = LKMMSearchPolicy::LKMMAnnotator(CK_Ver, &addChain, &Annotations);
     verifyChain(Annotations.IntactDeps[(int)DepType::ADDR], A.run<DepType::ADDR>(M, AM), M);
@@ -2279,6 +2567,10 @@ PreservedAnalyses LKMMVerifyDepsPass::run(Module &M,
   }
 
   Opt << M;
+  for (auto &F : M) {
+    if (F.hasFnAttribute("is_entry"))
+      saveMiniModule(&F, ModDir, "2");
+  }
 
   errs() << "\n^^^^^~~~~~~~~~ LKMMVerifyDepsPass ~~~~~^^^^^\n";
 

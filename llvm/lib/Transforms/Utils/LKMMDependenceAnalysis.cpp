@@ -376,37 +376,65 @@ std::set<Function *> getReachableFunctions(Function *F) {
 
   return Out;
 }
+
+static bool collectFromGlobal(std::set<GlobalVariable *> &Out, Constant *C, std::set<Function *> &Found) {
+  if (auto GV = dyn_cast<GlobalVariable>(C)) {
+    auto r = Out.insert(GV);
+    // check the initializer for more globals
+    if (GV->getName() == "should_skip_vma") {
+      errs() << "found fn. inserted? " << r.second << " \n";
+    }
+    if (GV->hasInitializer() && r.second)
+      collectFromGlobal(Out, GV->getInitializer(), Found);
+
+    return r.second;
+  }
+
+  bool Changed = false;
+  if (auto *CA = dyn_cast<ConstantAggregate>(C)) {
+    for (Use &U : CA->operands()) {
+        Changed |= collectFromGlobal(Out, dyn_cast<Constant>(U.get()), Found);
+    }
+  }
+
+  if (auto *F = dyn_cast<Function>(C)) {
+    Found.insert(F);
+  }
+
+  return Changed;
+}
+
 std::set<GlobalVariable *> getReachableGlobals(std::set<Function *> &Fs) {
   std::set<GlobalVariable *> Out;
+  bool GsChanged = false;
 
-  for (auto *F : Fs) {
-    for (auto &BB : *F) {
+  std::set<Function *> WorkFs = Fs;
+  std::set<Function *> Visited;
+
+  std::set<Function *> Found;
+  while (!WorkFs.empty()) {
+    GsChanged = false;
+    Found.clear();
+    auto F = WorkFs.begin();
+    for (auto &BB : **F) {
       for (auto &I : BB) {
         for (auto &Op : I.operands()) {
-          if (auto *GV = dyn_cast<GlobalVariable>(Op)) {
-            Out.insert(GV);
-            if (!GV->hasInitializer())
-              continue;
-            if (auto *CA = dyn_cast<ConstantArray>(GV->getInitializer())) {
-              for (Use &Op : CA->operands()) {
-                if (auto *NGV = dyn_cast<GlobalVariable>(Op)) {
-                  Out.insert(NGV);
-                }
-                if (auto *F = dyn_cast<Function>(Op)) {
-                  if (F->isDeclaration())
-                    continue;
-                  Fs.insert(F);
-                }
-              }
-            }
-            if (auto *CV = dyn_cast<GlobalVariable>(GV->getInitializer())) {
-              Out.insert(CV);
-            }
-            if (auto *F = dyn_cast<Function>(Op)) {
-              Fs.insert(F);
-            }
+          auto *Val = Op.get();
+          if (auto *GV = dyn_cast<GlobalVariable>(Val)) {
+            GsChanged |= collectFromGlobal(Out, GV, Found);
           }
         }
+      }
+    }
+    auto Nh = WorkFs.extract(F);
+    auto r = Visited.insert(Nh.value());
+
+    if (!Found.empty()) {
+      // check if new globals reference functions
+      for (auto *NF : Found) {
+        if (Visited.find(NF) != Visited.end()) continue;
+        WorkFs.insert(NF);
+        Fs.insert(NF);
       }
     }
   }

@@ -365,8 +365,6 @@ std::set<Function *> getReachableFunctions(Function *F) {
       for (auto &I : BB) {
         if (auto *CI = dyn_cast<CallInst>(&I)) {
           if (Function *CalleeF = CI->getCalledFunction()) {
-            if (CalleeF->isDeclaration())
-              continue;
             WorkSet.insert(CalleeF);
           }
         }

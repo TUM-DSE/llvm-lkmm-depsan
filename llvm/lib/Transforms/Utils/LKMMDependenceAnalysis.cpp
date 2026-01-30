@@ -363,8 +363,8 @@ std::set<Function *> getReachableFunctions(Function *F) {
 
     for (auto &BB : *CurrF) {
       for (auto &I : BB) {
-        if (auto *CI = dyn_cast<CallInst>(&I)) {
-          if (Function *CalleeF = CI->getCalledFunction()) {
+        for (auto &Op : I.operands()) {
+          if (auto *CalleeF = dyn_cast<Function>(Op.get())) {
             WorkSet.insert(CalleeF);
           }
         }
@@ -395,6 +395,12 @@ static bool collectFromGlobal(std::set<GlobalVariable *> &Out, Constant *C, std:
     }
   }
 
+  if (auto *CE = dyn_cast<ConstantExpr>(C)) {
+    for (Use &U : CE->operands()) {
+        Changed |= collectFromGlobal(Out, dyn_cast<Constant>(U.get()), Found);
+    }
+  }
+
   if (auto *F = dyn_cast<Function>(C)) {
     Found.insert(F);
   }
@@ -418,7 +424,7 @@ std::set<GlobalVariable *> getReachableGlobals(std::set<Function *> &Fs) {
       for (auto &I : BB) {
         for (auto &Op : I.operands()) {
           auto *Val = Op.get();
-          if (auto *GV = dyn_cast<GlobalVariable>(Val)) {
+          if (auto *GV = dyn_cast<Constant>(Val)) {
             GsChanged |= collectFromGlobal(Out, GV, Found);
           }
         }
@@ -2435,24 +2441,20 @@ bool LKMMAnnotatePrimitives::getAtomicAnnot(StringRef Name, const StringRef **At
 }
 bool LKMMAnnotatePrimitives::getPrimitiveAnnot(StringRef Name, StringRef *Attr) {
 
+  auto FixedN = Name;
+  if (std::strncmp(Name.data(), "__depsan_atomic_xadd", 20) == 0)
+    FixedN = xadd;
+
   for (auto *It = adl_begin(Macros); It != adl_end(Macros); It++) {
-    if (std::strncmp(Name.data(), It->data(), It->size()) == 0) {
-      *Attr = Name.drop_back(2);
+    if (std::strncmp(FixedN.data(), It->data(), It->size()) == 0) {
+      int drop = FixedN.back() != '\0' ? 2 : 3;
+      *Attr = FixedN.drop_back(drop);
       return true;
     }
   }
 
   return false;
 }
-// bool LKMMAnnotatePrimitives::getPrimitiveAnnotE(StringRef Name, StringRef const **Attr) {
-// 
-//   auto *Ptr = find(Ends, Name);
-//   if (Ptr == adl_end(Ends))
-//     return false;
-// 
-//   *Attr = Ptr;
-//   return true;
-// }
 
 void LKMMAnnotatePrimitives::transform(Function &F) {
 
@@ -2460,39 +2462,43 @@ void LKMMAnnotatePrimitives::transform(Function &F) {
   SmallVector<StringRef, 3> Annotations;
 
   StringRef Annot;
+  StringRef Name;
   for (auto &BB : F) {
-    for (auto I = BB.begin(); I != BB.end(); I++ ) {
-      if (auto *CI = dyn_cast<CallInst>(I)) {
+    for (auto I = BB.begin(); I != BB.end(); ++I ) {
+      if (auto *CI = dyn_cast<CallInst>(&*I)) {
         auto *Callee = CI->getCalledFunction();
         if (!Callee)
           goto isAsm;
-
-        if (getPrimitiveAnnot(Callee->getName(), &Annot)) {
-          auto *It = std::find(Annotations.begin(), Annotations.end(), Annot);
+        if (Callee->isIntrinsic()) {
+          if (Callee->getIntrinsicID() != Intrinsic::annotation)
+            goto isAsm;
+          auto *GV = cast<GlobalVariable>(CI->getArgOperand(1));
+          assert(GV->hasInitializer() && "Expected initializer");
+          auto *CDA = cast<ConstantDataArray>(GV->getInitializer());
+          Name = CDA->getAsString();
+        } else {
+          Name = Callee->getName();
+        }
+        if (getPrimitiveAnnot(Name, &Annot)) {
+          auto *It = std::find_if_not(Annotations.begin(), Annotations.end(), [Annot](StringRef A) { return std::strncmp(A.data(), Annot.data(), Annot.size()); });
           if (It != Annotations.end()) {
             // _e annotation hopefully
+
+            if (Callee->isIntrinsic())
+              CI->replaceAllUsesWith(CI->getArgOperand(0));
+
             I = CI->eraseFromParent();
-            if (Annot == "__depsan_ronce") {
-              if (auto *LI = dyn_cast<LoadInst>(I)) {
-                auto J = I;
-                for ( size_t i = 0; i < 3; i++, J++) {
-                    MDNode *Meta = MDNode::get((J)->getContext(), MDString::get(J->getContext(), Annot));
-                    MDNode *Existing = J->getMetadata(LLVMContext::MD_lkmm_primitive);
-                    if (Existing)
-                      Meta = MDNode::concatenate(Existing, Meta);
-                    J->setMetadata(LLVMContext::MD_lkmm_primitive, Meta);
-                }
-              } else {
-                errs() << "[WARN] READ_ONCE does not end in a load\n";
-              }
-            }
+            I--;
+
             Annotations.erase(It);
             Annot = StringRef();
-          } else {
-            // _b annotation hopefully
-            Annotations.push_back(Annot);
-            I = CI->eraseFromParent();
+            continue;
           }
+          // _b annotation hopefully
+          Annotations.push_back(Annot);
+          I = CI->eraseFromParent();
+          I--;
+          continue;
         }
       }
 isAsm:

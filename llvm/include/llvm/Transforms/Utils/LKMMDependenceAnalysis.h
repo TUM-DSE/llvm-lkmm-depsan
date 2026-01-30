@@ -629,6 +629,7 @@ public:
     "spin_unlock",
   };
 
+  constexpr static StringRef xadd = "__depsan_atomic_fetch_add_x";
   constexpr static StringRef Macros[] = {
     "__depsan_mb",
     "__depsan_rmb",
@@ -647,21 +648,6 @@ public:
     "__depsan_rcu_assign",
     "__depsan_rcu_sync",
   };
-  //constexpr static StringRef Ends[] = {
-  //  "__depsan_mb_e",
-  //  "__depsan_rmb_e",
-  //  "__depsan_wmb_e",
-  //  "__depsan_release_e",
-  //  "__depsan_acquire_e",
-  //  "__depsan_atomic_e",
-  //  "__depsan_ronce_e",
-  //  "__depsan_wonce_e",
-  //  "__depsan_lock_e",
-  //  "__depsan_unlock_e",
-  //  "__depsan_rcu_deref_e",
-  //  "__depsan_rcu_assign_e",
-  //  "__depsan_rcu_sync_e",
-  //};
 
 private:
   void transform(Function &F);

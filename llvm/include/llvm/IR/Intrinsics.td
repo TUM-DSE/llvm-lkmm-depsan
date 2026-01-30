@@ -1508,7 +1508,7 @@ def int_ptr_annotation : DefaultAttrsIntrinsic<
     [IntrInaccessibleMemOnly], "llvm.ptr.annotation">;
 
 def int_annotation : DefaultAttrsIntrinsic<
-    [llvm_anyint_ty],
+    [llvm_any_ty],
     [LLVMMatchType<0>, llvm_anyptr_ty, LLVMMatchType<1>, llvm_i32_ty],
     [IntrInaccessibleMemOnly], "llvm.annotation">;
 

@@ -222,9 +222,10 @@ static bool BuiltinAnnotation(Sema &S, CallExpr *TheCall) {
   // First argument should be an integer.
   Expr *ValArg = TheCall->getArg(0);
   QualType Ty = ValArg->getType();
-  if (!Ty->isIntegerType()) {
+  if (!Ty->isIntegerType() && !Ty->isPointerType() && !Ty->isRecordType()) {
     S.Diag(ValArg->getBeginLoc(), diag::err_builtin_annotation_first_arg)
         << ValArg->getSourceRange();
+    Ty->getUnqualifiedDesugaredType()->dump();
     return true;
   }
 

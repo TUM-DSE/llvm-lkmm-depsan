@@ -653,7 +653,7 @@ private:
   void transform(Function &F);
   bool getAtomicAnnot(StringRef Name, const StringRef **Attr);
   bool getPrimitiveAnnot(StringRef Name, StringRef *Attr);
-  //bool getPrimitiveAnnotE(StringRef Name, const StringRef **Attr);
+  bool begins(StringRef Name);
 };
 
 //===----------------------------------------------------------------------===//

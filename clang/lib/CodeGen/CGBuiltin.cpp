@@ -5221,7 +5221,6 @@ RValue CodeGenFunction::EmitBuiltinExpr(const GlobalDecl GD, unsigned BuiltinID,
     return RValue::getIgnored();
   }
   case Builtin::BI__builtin_annotation: {
-    //llvm::Value *AnnVal = EmitScalarExpr(E->getArg(0));
     RValue RV = EmitAnyExprToTemp(E->getArg(0));
     llvm::Value *AnnVal;
     if (RV.isScalar()) {
@@ -5242,8 +5241,12 @@ RValue CodeGenFunction::EmitBuiltinExpr(const GlobalDecl GD, unsigned BuiltinID,
     // non-wide string literal, potentially casted, so the cast<> is safe.
     const Expr *AnnotationStrExpr = E->getArg(1)->IgnoreParenCasts();
     StringRef Str = cast<StringLiteral>(AnnotationStrExpr)->getString();
-    return RValue::get(
+    if (RV.isScalar()) {
+      return RValue::get(
         EmitAnnotationCall(F, AnnVal, Str, E->getExprLoc(), nullptr));
+    }
+    EmitAnnotationCall(F, AnnVal, Str, E->getExprLoc(), nullptr);
+    return RV;
   }
   case Builtin::BI__builtin_addcb:
   case Builtin::BI__builtin_addcs:

@@ -2439,6 +2439,14 @@ bool LKMMAnnotatePrimitives::getAtomicAnnot(StringRef Name, const StringRef **At
   *Attr = Ptr;
   return true;
 }
+bool LKMMAnnotatePrimitives::begins(StringRef Name) {
+
+  auto Tmp = Name;
+  if (Tmp.back() == '\0')
+    Tmp = Tmp.drop_back(1);
+
+  return Tmp.back() == 'b';
+}
 bool LKMMAnnotatePrimitives::getPrimitiveAnnot(StringRef Name, StringRef *Attr) {
 
   auto FixedN = Name;
@@ -2458,7 +2466,6 @@ bool LKMMAnnotatePrimitives::getPrimitiveAnnot(StringRef Name, StringRef *Attr) 
 
 void LKMMAnnotatePrimitives::transform(Function &F) {
 
-  bool InPrimitive = false;
   SmallVector<StringRef, 3> Annotations;
 
   StringRef Annot;
@@ -2480,18 +2487,21 @@ void LKMMAnnotatePrimitives::transform(Function &F) {
           Name = Callee->getName();
         }
         if (getPrimitiveAnnot(Name, &Annot)) {
-          auto *It = std::find_if_not(Annotations.begin(), Annotations.end(), [Annot](StringRef A) { return std::strncmp(A.data(), Annot.data(), Annot.size()); });
-          if (It != Annotations.end()) {
-            // _e annotation hopefully
 
+          if (!begins(Name)) {
+          //auto *It = std::find_if_not(Annotations.begin(), Annotations.end(), [Annot](StringRef A) { return std::strncmp(A.data(), Annot.data(), Annot.size()); });
+            assert(Annotations.back() == Annot && "Mismatched annotation");
+
+            // FIXME: remove leftover load agg.tmp if this was an aggExpr?
+            // should be taken care of by DCE anyways
             if (Callee->isIntrinsic())
               CI->replaceAllUsesWith(CI->getArgOperand(0));
 
             I = CI->eraseFromParent();
             I--;
 
-            Annotations.erase(It);
             Annot = StringRef();
+            Annotations.pop_back();
             continue;
           }
           // _b annotation hopefully
@@ -2504,7 +2514,8 @@ void LKMMAnnotatePrimitives::transform(Function &F) {
 isAsm:
       if (!Annotations.empty()) {
         //assert(Annot && "Missing annotation");
-        for (auto Annot : Annotations) {
+        auto Anns = std::set<StringRef>(Annotations.begin(), Annotations.end());
+        for (auto Annot : Anns) {
           MDNode *Meta = MDNode::get(I->getContext(), MDString::get(I->getContext(), Annot));
           MDNode *Existing = I->getMetadata(LLVMContext::MD_lkmm_primitive);
           if (Existing)

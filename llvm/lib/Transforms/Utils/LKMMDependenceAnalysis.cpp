@@ -1618,11 +1618,17 @@ void BUCtx<DT>::visitBasicBlock(BasicBlock &BB) {
         if (auto *SI = dyn_cast<StoreInst>(&I)) {
           if (!SI->isVolatile())
             continue;
+          MDNode *Existing = SI->getMetadata(LLVMContext::MD_lkmm_primitive);
+          if (!Existing)
+            continue;
 
           PtrOrVal = SI->getPointerOperand();
         }
         if (auto *LI = dyn_cast<LoadInst>(&I)) {
           if (!LI->isVolatile())
+            continue;
+          MDNode *Existing = LI->getMetadata(LLVMContext::MD_lkmm_primitive);
+          if (!Existing)
             continue;
 
           PtrOrVal = LI->getPointerOperand();
@@ -1641,6 +1647,9 @@ void BUCtx<DT>::visitBasicBlock(BasicBlock &BB) {
         // with the data operand being the end of the chain.
         if (auto *SI = dyn_cast<StoreInst>(&I)) {
           if (!SI->isVolatile())
+            continue;
+          MDNode *Existing = SI->getMetadata(LLVMContext::MD_lkmm_primitive);
+          if (!Existing)
             continue;
 
           PtrOrVal = SI->getValueOperand();
@@ -1762,6 +1771,9 @@ void BUCtx<DepType::CTRL>::visitBasicBlock(BasicBlock &BB) {
       if (auto *SI = dyn_cast<StoreInst>(&I)) {
         if (!SI->isVolatile())
           continue;
+        MDNode *Existing = SI->getMetadata(LLVMContext::MD_lkmm_primitive);
+        if (!Existing)
+          continue;
         auto End = std::make_unique<DC<LKMMSearchPolicy>>();
         End->addLink(SI, DCLevel::EMPTY);
         Ann->setNewDc(std::move(End));
@@ -1859,7 +1871,8 @@ void BUCtx<DT>::visitStore(StoreInst &SI) {
 
 template <DepType DT>
 void BUCtx<DT>::visitLoad(LoadInst &LI) {
-  if (LI.isVolatile()) {
+  MDNode *Existing = LI.getMetadata(LLVMContext::MD_lkmm_primitive);
+  if (LI.isVolatile() && Existing) {
     // We found an internal beginning!
     LKMMSearchPolicy::AnnotCtx<DT> *Ann = static_cast<LKMMSearchPolicy::AnnotCtx<DT> *>(this);
 
@@ -1918,6 +1931,9 @@ void BUCtx<DepType::CTRL>::searchInScope(Instruction &B) {
     for (auto &I : BB) {
       if (auto *SI = dyn_cast<StoreInst>(&I)) {
         if (!SI->isVolatile())
+          continue;
+        MDNode *Existing = SI->getMetadata(LLVMContext::MD_lkmm_primitive);
+        if (!Existing)
           continue;
 
         auto Curr = Ann->getDCPtr();
@@ -1988,7 +2004,8 @@ void BUCtx<DepType::CTRL>::searchInScope(Instruction &B) {
 
 template <>
 void BUCtx<DepType::CTRL>::visitLoad(LoadInst &LI) {
-  if (!LI.isVolatile()) {
+  MDNode *Existing = LI.getMetadata(LLVMContext::MD_lkmm_primitive);
+  if (!LI.isVolatile() || !Existing) {
     goThroughMem(LI);
     return;
   }
@@ -2658,6 +2675,9 @@ PreservedAnalyses LKMMAnnotatePrimitives::run(Module &M,
           if (Existing)
             Meta = MDNode::concatenate(Existing, Meta);
           CI->setMetadata(LLVMContext::MD_lkmm_primitive, Meta);
+
+          if (!CI->getType()->isVoidTy())
+            CI->addAnnotationMetadata("carries_dep");
         }
       }
     }

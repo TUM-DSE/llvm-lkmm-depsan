@@ -22,10 +22,12 @@
 #include "llvm/ADT/APFloat.h"
 #include "llvm/ADT/Hashing.h"
 #include "llvm/ADT/SetVector.h"
+#include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Analysis/CFG.h"
 #include "llvm/Analysis/CallGraph.h"
 #include "llvm/Analysis/LoopInfo.h"
+#include "llvm/Analysis/MemorySSA.h"
 #include "llvm/Analysis/PostDominators.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/IR/AttributeMask.h"
@@ -177,10 +179,12 @@ MK_COUNTS(Combined)
 
 MK_STATS(Combined)
 
-#define MAX_SIZE_PER_BUCKET 1000
-#define MAX_CHAIN_LENGTH    200
-#define MAX_VISITED_LINKS   1000000
+#define MAX_SIZE_PER_BUCKET 10000
+#define MAX_CHAIN_LENGTH    100
+#define MAX_VISITED_LINKS   100000
 #define MAX_CHAINS_PER_INST 1000
+#define MAX_PREV_STORES     5
+#define MAX_PHIS            3
 
 static int OutFD[2] = {2, 2};
 static size_t LinksVisited = 0;
@@ -499,6 +503,17 @@ bool dbgLocEq(const std::optional<DebugLoc> &L, const std::optional<DebugLoc> &R
          LVal.get()->getFilename() == RVal.get()->getFilename();
 }
 
+using AnySeg = std::variant<
+  SegmentID<0, 1, LKMMSearchPolicy>,
+  SegmentID<0, -1, LKMMSearchPolicy>,
+  SegmentID<0, 0, LKMMSearchPolicy>,
+  SegmentID<1, 1, LKMMSearchPolicy>,
+  SegmentID<1, -1, LKMMSearchPolicy>,
+  SegmentID<1, 0, LKMMSearchPolicy>,
+  SegmentID<-1, 1, LKMMSearchPolicy>,
+  SegmentID<-1, -1, LKMMSearchPolicy>,
+  SegmentID<-1, 0, LKMMSearchPolicy>>;
+
 template <DepType DT>
 static constexpr StringRef calls() {
   if constexpr (DT == DepType::ADDR)
@@ -630,6 +645,13 @@ public:
     return Val == O.Val && Lvl == O.Lvl && Depth == O.Depth;
   }
 };
+
+template<>
+void DC<LKMMSearchPolicy>::print() const {
+  for (const auto &L : Chain) {
+    L.Val->dump();
+  }
+}
 
 /// Represents a dependency chain link on source level. A dep chain link consists of a
 /// source code location, the corresponding dep chain level, and the function call depth.
@@ -847,17 +869,6 @@ void SegmentGraph::addEdge(SegmentID<B,M,C> *From, SegmentID<-M,E,C> *To) {
 template<int FE>
 const SegmentID<0,0,LKMMSearchPolicy> mkSeg(const SmallVector<SegmentNode*, 16> &Path) {
 
-  using AnySeg = std::variant<
-    SegmentID<0, 1, LKMMSearchPolicy>,
-    SegmentID<0, -1, LKMMSearchPolicy>,
-    SegmentID<0, 0, LKMMSearchPolicy>,
-    SegmentID<1, 1, LKMMSearchPolicy>,
-    SegmentID<1, -1, LKMMSearchPolicy>,
-    SegmentID<1, 0, LKMMSearchPolicy>,
-    SegmentID<-1, 1, LKMMSearchPolicy>,
-    SegmentID<-1, -1, LKMMSearchPolicy>,
-    SegmentID<-1, 0, LKMMSearchPolicy>>;
-
   AnySeg Res = *static_cast<SegmentID<0,FE,LKMMSearchPolicy> *>(Path.front()->Seg);
 
   for (auto *N = Path.begin()+1; N != Path.end(); N++) {
@@ -902,12 +913,16 @@ const SegmentID<0,0,LKMMSearchPolicy> mkSeg(const SmallVector<SegmentNode*, 16> 
   return get<SegmentID<0,0,LKMMSearchPolicy>>(Res);
 }
 
+
 void SegmentGraph::enumeratePaths(size_t i, void (*AnnoFn)(const SegmentID<0,0, LKMMSearchPolicy> &Seg, const DepType Type, LKMMAnnotateDeps::DepMap *Result), DepType Type, LKMMAnnotateDeps::DepMap *Result) {
   assert(i > 1 && "Path length must be at least 2");
 
   for (auto *N : StartSet) {
     SmallVector<SegmentNode*, 16> Path = { };
     SmallVector<SegmentNode*, 16> WorkSet = { N };
+    // We track calls, so we limit where we can return to.
+    // But on an empty stack we can return to anywhere.
+    SmallVector<Function *, 8> CallStack = {};
 
     SegmentNode *Pop = nullptr;
 
@@ -917,11 +932,26 @@ void SegmentGraph::enumeratePaths(size_t i, void (*AnnoFn)(const SegmentID<0,0, 
 
       if (Curr == Pop) {
         WorkSet.pop_back();
-        goto pop;
+        Path.pop_back();
+        continue;
       }
 
-      Path.push_back(WorkSet.back());
+      Path.push_back(Curr);
       WorkSet.pop_back();
+
+      // If we just came to this segment by call, we put the caller on the stack
+      if (Curr->B == -1) {
+        if (Curr->E == 1) {
+           auto *Seg = static_cast<SegmentID<-1, 1, LKMMSearchPolicy> *>(Curr->Seg);
+           CallStack.push_back(Seg->getDC().Chain.back().Val->getFunction());
+        } else if (Curr->E == -1){
+           auto *Seg = static_cast<SegmentID<-1, -1, LKMMSearchPolicy> *>(Path.back()->Seg);
+           CallStack.push_back(Seg->getDC().Chain.back().Val->getFunction());
+        } else {
+           auto *Seg = static_cast<SegmentID<-1, 0, LKMMSearchPolicy> *>(Path.back()->Seg);
+           CallStack.push_back(Seg->getDC().Chain.back().Val->getFunction());
+        }
+      }
 
       if (Path.back()->E == 0) {
         // We reached a leaf node, annotate the path
@@ -937,8 +967,24 @@ void SegmentGraph::enumeratePaths(size_t i, void (*AnnoFn)(const SegmentID<0,0, 
 
       WorkSet.push_back(Pop);
       for (auto *S : Curr->Successors) {
-          WorkSet.push_back(S);
+        // If this segment returns, we only add successors returning to the top of the stack
+        if (Curr->E == 1 && !CallStack.empty()) {
+          if (Curr->B == 1) {
+             auto *Seg = static_cast<SegmentID<1, 1, LKMMSearchPolicy> *>(Curr->Seg);
+             if (Seg->getDC().Chain.back().Val->getFunction() == CallStack.back()) {
+                WorkSet.push_back(S);
+             }
+          } else if (Curr->B == -1){
+             auto *Seg = static_cast<SegmentID<-1, 1, LKMMSearchPolicy> *>(Path.back()->Seg);
+             if (Seg->getDC().Chain.back().Val->getFunction() == CallStack.back()) {
+                WorkSet.push_back(S);
+             }
+          } else {
+            llvm_unreachable("Invalid segment type: <0, 1> should not hava a stack");
+          }
+        }
       }
+      if (Curr->E == 1 && !CallStack.empty()) CallStack.pop_back();
       continue;
 
     pop:
@@ -1024,7 +1070,7 @@ public:
   void visitGetElementPtrInst(GetElementPtrInst &GEP);
 
   // FIXME: is this "conditional"?
-  void visitPHINode(PHINode &PN) {};
+  void visitPHINode(PHINode &PN);
 
   void visitTruncInst(TruncInst &TI) {};
 
@@ -1102,6 +1148,9 @@ public:
 #define GET(Dep) auto *get##Dep() { return Dep; }
   FOR_EACH_DP(GET)
 #undef GET
+
+  void setMSSA(MemorySSA &MSSA) { this->MSSA = &MSSA; }
+  MemorySSA &getMSSA() { return *MSSA; }
 
   void setPDT(PostDominatorTree &PDT) { this->PDT = &PDT; }
   PostDominatorTree &getPDT() { return *PDT; }
@@ -1290,6 +1339,7 @@ private:
   MayRiseRisingDeps_t *MRR = nullptr;
   MayRiseMayDangleDeps_t *MRMD = nullptr;
 
+  MemorySSA *MSSA = nullptr;
   PostDominatorTree *PDT = nullptr;
 
   void buildTransitiveClosure(const size_t Depth);
@@ -1572,6 +1622,14 @@ void BUCtx<DT>::visit(Value *V) {
   FOR_EACH_DP(CAP)
 #undef CAP
 
+  LinksVisited++;
+
+  if (std::find_if(Ann->getDc().Chain.begin(), Ann->getDc().Chain.end(),
+        [V](const LKMMSearchPolicy::DCLink &L) { return L.Val == V; }) != Ann->getDc().Chain.end()) {
+    errs() << "[WARN] Not checking circular dependencies\n";
+    return;
+  }
+
   if (Ann->getDc().Chain.size() > MAX_CHAIN_LENGTH) {
     errs() << "[WARN] Chain too long, give up\n";
     return;
@@ -1583,16 +1641,23 @@ void BUCtx<DT>::visit(Value *V) {
     return;
   }
 
-  LinksVisited++;
-
   if (auto *I = dyn_cast<Instruction>(V)) {
     auto *NextBB = I->getParent();
     // Whatever we want to insert, it is in a different BB.
     // We need to check for branches, even for addr & data dependencies
     // because they can be optimized to selects.
     if (!Ann->getDc().Chain.empty() && NextBB != Ann->getDc().Chain.back().Val->getParent()) {
+      // If the branch is marked as a loop, we ignore it.
+      auto *T = NextBB->getTerminator();
+      MDNode *Loop = T->getMetadata(LLVMContext::MD_loop);
+      if (Loop) {
+        errs() << "[WARN] Not doing loops\n";
+        return;
+      }
       handleBranch(NextBB);
+
     }
+
     InstVisitor<BUCtx<DT>>::visit(I);
   }
   if (auto *A = dyn_cast<Argument>(V)) {
@@ -1689,12 +1754,14 @@ void BUCtx<DT>::visitBasicBlock(BasicBlock &BB) {
     // We also need to track any potential chains from call isntructions.
       if (auto *CI = dyn_cast<CallInst>(&I)) {
         // Only track calls to functions we have seen before.
-        if (CI->getCalledFunction() && !CI->getCalledFunction()->getAttributes().hasFnAttr(takes<DT>()))
+        if (!CI->getCalledFunction())
+          continue;
+        if (!CI->getCalledFunction()->getAttributes().hasFnAttr(takes<DT>()))
           continue;
 
         for (auto &Arg : CI->args()) {
           auto ArgNo = CI->getArgOperandNo(&Arg);
-          if (CI->getCalledFunction() && !CI->getCalledFunction()->getAttributes().hasParamAttr(ArgNo, is<DT>()))
+          if (!CI->getCalledFunction()->getAttributes().hasParamAttr(ArgNo, is<DT>()))
               continue;
 
           auto End = std::make_unique<DC<LKMMSearchPolicy>>();
@@ -2013,55 +2080,73 @@ void BUCtx<DepType::CTRL>::visitLoad(LoadInst &LI) {
   searchInScope(LI);
 }
 
-
 template <DepType DT>
 void BUCtx<DT>::goThroughMem(LoadInst &LI) {
 
   auto *Ann = (LKMMSearchPolicy::AnnotCtx<DT> *)this;
 
-  // TODO: Are double load/stores ok?
-  // Sounds like aliasing
-  //if (getLastNonEmptyLvl(Ann->getDc().Chain) != DCLevel::PTR) return;
-
-  //FIXME
-  //assert(getLastNonEmptyLvl(Ann->getDc().Chain) == DCLevel::PTR &&
-  //       "Expected a pointer to be the last link in the chain for Load");
   Ann->getDc().addLink(&LI, DCLevel::PTE);
 
-  // Find previous stores that write the same location and continue there.
-  // Anything else is potential alias territory (conservatively speaking)
-  //if (!LI.getPointerOperand()->hasOneUse())
-  //  return;
   if (!LI.getPointerOperand()->hasUseList())
     return;
 
-  for (auto *U : LI.getPointerOperand()->users()) {
-    if (!isa<StoreInst>(U))
+  SmallVector<MemoryAccess *, 4> Workset;
+  SmallSet<MemoryAccess *, 8> Visited;
+
+  auto &MSSA = Ann->getMSSA();
+  auto *Walker = MSSA.getWalker();
+  MemoryAccess* def = Walker->getClobberingMemoryAccess(&LI);
+  MemoryLocation Loc(MemoryLocation::get(&LI));
+
+  size_t Phis = 0;
+
+  SmallPtrSet<BasicBlock *, 2> LaterBBs;
+  for (auto *BB : successors(LI.getParent()))
+    LaterBBs.insert(BB);
+
+  if (def)
+    Workset.push_back(def);
+
+  // Continue the chain at the last store (in po) that wrote to the same addr-value.
+  // Notably not the same location.
+  // PHI nodes fan-out the chain.
+  while (!Workset.empty()) {
+    auto *MA = Workset.pop_back_val();
+    if (!Visited.insert(MA).second)
       continue;
 
-    auto *SI = cast<StoreInst>(U);
-
-    if (SI->getFunction() != LI.getFunction())
+    if (MSSA.isLiveOnEntryDef(MA))
       continue;
 
-    if (!isPotentiallyReachable(SI->getParent(), LI.getParent())) continue;
+    if (auto *SD = dyn_cast<MemoryDef>(MA)) {
+      auto *SI = dyn_cast_if_present<StoreInst>(SD->getMemoryInst());
 
-    for (auto L = Ann->getDc().Chain.crbegin(); L != Ann->getDc().Chain.crend(); L++) {
-      if (L->Val == SI)
-        goto skip;
-    }
-    {
-      if (SI->getPointerOperand() == LI.getPointerOperand()) {
-        auto Curr = Ann->getDCPtr();
-        auto Cpy = std::make_unique<DC<LKMMSearchPolicy>>(*Curr);
+      if ((!SI) || (!isPotentiallyReachable(SI, &LI, &LaterBBs)) ||
+        (SI->getPointerOperand() != LI.getPointerOperand())) {
 
-        Ann->setNewDc(std::move(Cpy));
-        visit(SI);
-        Ann->setNewDc(std::move(Curr));
+        Workset.push_back(Walker->getClobberingMemoryAccess(SD->getDefiningAccess(), Loc));
+        continue;
+      }
+
+      auto Curr = Ann->getDCPtr();
+      auto Cpy = std::make_unique<DC<LKMMSearchPolicy>>(*Curr);
+
+      Ann->setNewDc(std::move(Cpy));
+      visit(SI);
+      Ann->setNewDc(std::move(Curr));
+    } else if (auto *PHI = dyn_cast<MemoryPhi>(MA)) {
+
+      Phis++;
+
+      if (Phis > MAX_PHIS) {
+        errs() << "[WARN] Too many PHIs, prune\n";
+        const auto &Use = PHI->getIncomingValue(0);
+        Workset.push_back(Use);
+      } else {
+        for (const auto &Use : PHI->incoming_values())
+          Workset.push_back(cast<MemoryAccess>(&Use));
       }
     }
-skip:
-    ;
   }
 }
 
@@ -2088,6 +2173,24 @@ void BUCtx<DT>::visitGetElementPtrInst(GetElementPtrInst &GEP) {
   // Track the pointer
   Ann->setNewDc(std::move(Curr));
   visit(GEP.getPointerOperand());
+}
+
+template <DepType DT>
+void BUCtx<DT>::visitPHINode(PHINode &PN) {
+  // We know this is control flow, but the generic visit should catch the difference in BBs
+
+  auto *Ann = (LKMMSearchPolicy::AnnotCtx<DT> *)this;
+  Ann->getDc().addLink(&PN, getLastNonEmptyLvl(Ann->getDc().Chain));
+
+  auto Curr = Ann->getDCPtr();
+
+  for (auto &In : PN.incoming_values()) {
+    auto Cpy = std::make_unique<DC<LKMMSearchPolicy>>(*Curr);
+    Ann->setNewDc(std::move(Cpy));
+    visit(In.get());
+  }
+
+  Ann->setNewDc(std::move(Curr));
 }
 
 template <DepType DT>
@@ -2228,19 +2331,21 @@ private:
   } Stats;
 
   void reset(bool Full = true) {
-    if (Full) {
-      IntactDeps->clear();
-      RisingDeps->clear();
-      MayDangleDeps->clear();
-    }
-    DanglingDeps->clear();
-    RisingDanglingDeps->clear();
-    MayDangleDanglingDeps->clear();
-    MayRiseDeps->clear();
-    MayRiseRisingDeps->clear();
-    MayRiseMayDangleDeps->clear();
+    IntactDeps->clear();
+    RisingDeps->clear();
+    MayDangleDeps->clear();
 
-    Stats = {0, 0, 0, 0, 0, 0, 0, 0, 0};
+    if (Full) {
+      DanglingDeps->clear();
+      RisingDanglingDeps->clear();
+      MayDangleDanglingDeps->clear();
+      MayRiseDeps->clear();
+      MayRiseRisingDeps->clear();
+      MayRiseMayDangleDeps->clear();
+    }
+
+    //Stats = {0, 0, 0, 0, 0, 0, 0, 0, 0};
+    saveStats();
   }
   SmallVector<DC> DCs;
 };
@@ -2302,6 +2407,7 @@ llvm::LKMMAnnotateDeps::DepMap *LKMMSearchPolicy::LKMMAnnotator::run(Module &M, 
     if (F.empty())
       continue;
 
+    AC.setMSSA(FAM.getResult<MemorySSAAnalysis>(F).getMSSA());
     AC.setPDT(FAM.getResult<PostDominatorTreeAnalysis>(F));
 
     // Annotate dependencies ending in volatile loads and stores.
@@ -2313,6 +2419,10 @@ llvm::LKMMAnnotateDeps::DepMap *LKMMSearchPolicy::LKMMAnnotator::run(Module &M, 
     Depth--;
 
     for (auto &F : M) {
+      if (F.empty())
+        continue;
+
+      AC.setMSSA(FAM.getResult<MemorySSAAnalysis>(F).getMSSA());
       AC.setPDT(FAM.getResult<PostDominatorTreeAnalysis>(F));
       if constexpr (DT == DepType::CTRL) {
         //Annotate dependencies ending in nested calls.
@@ -2327,6 +2437,10 @@ llvm::LKMMAnnotateDeps::DepMap *LKMMSearchPolicy::LKMMAnnotator::run(Module &M, 
     }
 
     for (auto &F : M) {
+      if (F.empty())
+        continue;
+
+      AC.setMSSA(FAM.getResult<MemorySSAAnalysis>(F).getMSSA());
       AC.setPDT(FAM.getResult<PostDominatorTreeAnalysis>(F));
       if constexpr (DT == DepType::CTRL) {
         //Annotate dependencies ending in nested ends.
@@ -2345,12 +2459,20 @@ llvm::LKMMAnnotateDeps::DepMap *LKMMSearchPolicy::LKMMAnnotator::run(Module &M, 
       DataAC.populate(AC.getI(), AC.getR(), AC.getMD(), AC.getD(), AC.getRD(), AC.getMDD(), AC.getMR(), AC.getMRR(), AC.getMRMD());
       // We need to do this after both passTwo and passThree
       for (auto &F : M) {
+        if (F.empty())
+          continue;
+
+        DataAC.setMSSA(FAM.getResult<MemorySSAAnalysis>(F).getMSSA());
         DataAC.setPDT(FAM.getResult<PostDominatorTreeAnalysis>(F));
         if (!F.getAttributes().getRetAttrs().hasAttribute(returns<DepType::DATA>()))
           continue;
         DataAC.passTwo(&F);
       }
       for (auto &F : M) {
+        if (F.empty())
+          continue;
+
+        DataAC.setMSSA(FAM.getResult<MemorySSAAnalysis>(F).getMSSA());
         DataAC.setPDT(FAM.getResult<PostDominatorTreeAnalysis>(F));
         if (!F.hasFnAttribute(calls<DepType::DATA>()))
           continue;
@@ -2511,8 +2633,12 @@ void LKMMAnnotatePrimitives::transform(Function &F) {
 
             // FIXME: remove leftover load agg.tmp if this was an aggExpr?
             // should be taken care of by DCE anyways
-            if (Callee->isIntrinsic())
+            if (Callee->isIntrinsic()) {
+
+              if (auto *I = dyn_cast<Instruction>(CI->getArgOperand(0)))
+                I->addAnnotationMetadata("lkmm_load");
               CI->replaceAllUsesWith(CI->getArgOperand(0));
+            }
 
             I = CI->eraseFromParent();
             I--;
@@ -2677,7 +2803,7 @@ PreservedAnalyses LKMMAnnotatePrimitives::run(Module &M,
           CI->setMetadata(LLVMContext::MD_lkmm_primitive, Meta);
 
           if (!CI->getType()->isVoidTy())
-            CI->addAnnotationMetadata("carries_dep");
+            CI->addAnnotationMetadata("lkmm_load");
         }
       }
     }

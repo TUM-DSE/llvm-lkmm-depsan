@@ -171,6 +171,8 @@ struct DC {
     return !(*this < Other) && !(Other < *this);
   }
 
+  void print() const = delete;
+
   class DCHash {
   public:
     std::size_t operator()(const DC &DC) const noexcept {

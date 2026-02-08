@@ -2907,6 +2907,7 @@ PreservedAnalyses LKMMAnnotatePrimitives::run(Module &M,
           // if (!CI->getType()->isVoidTy())
           //   CI->addAnnotationMetadata("lkmm_load");
           // CI->addAnnotationMetadata("lkmm_store");
+        }
       }
     }
 

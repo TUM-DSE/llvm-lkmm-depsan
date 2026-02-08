@@ -610,6 +610,39 @@ static constexpr StringRef DepToStr(const DepType DT) {
     llvm_unreachable("Unknown dep type");
 }
 
+static bool isLKMMLoad(Instruction *I) {
+  if (auto *Existing = I->getMetadata(LLVMContext::MD_annotation)) {
+    auto *Tuple = cast<MDTuple>(Existing);
+    for (auto &N : Tuple->operands()) {
+      if (isa<MDString>(N.get()) &&
+          cast<MDString>(N.get())->getString() == "lkmm_load")
+        return true;
+    }
+  }
+  if (auto *LI = dyn_cast<LoadInst>(I)) {
+    MDNode *Existing = LI->getMetadata(LLVMContext::MD_lkmm_primitive);
+    if (LI->isVolatile() && Existing)
+      return true;
+  }
+  return false;
+}
+static bool isLKMMStore(Instruction *I) {
+  if (auto *Existing = I->getMetadata(LLVMContext::MD_annotation)) {
+    auto *Tuple = cast<MDTuple>(Existing);
+    for (auto &N : Tuple->operands()) {
+      if (isa<MDString>(N.get()) &&
+          cast<MDString>(N.get())->getString() == "lkmm_store")
+        return true;
+    }
+  }
+  if (auto *SI = dyn_cast<StoreInst>(I)) {
+    MDNode *Existing = SI->getMetadata(LLVMContext::MD_lkmm_primitive);
+    if (SI->isVolatile() && Existing)
+      return true;
+  }
+  return false;
+}
+
 raw_fd_ostream &chains(size_t I) {
   static raw_fd_ostream S[2] { raw_fd_ostream(OutFD[0], false, true), raw_fd_ostream(OutFD[1], false, true) } ;
   return S[I];
@@ -629,16 +662,19 @@ void removeDuplicates(std::vector<SegmentID<B,E,C>> &Segments) {
 /// after other optimisation passes
 class LKMMSearchPolicy::DCLink : public DCLinkBase {
 public:
-  DCLink(Instruction *Val, const DCLevel Lvl, int Depth) : DCLinkBase(Val->getDebugLoc()?Val->getDebugLoc().get():nullptr, Lvl, Depth), Val(Val) {}
+  DCLink(Instruction *Val, const DCLevel Lvl, int Depth) : DCLinkBase(Val->getDebugLoc()?Val->getDebugLoc().get():nullptr, Lvl, isLKMMStore(Val), isLKMMLoad(Val), Depth), Val(Val) {}
   ~DCLink() = default;
 
-  DCLink(const DCLink &Other) : DCLinkBase(Other.Loc, Other.Lvl, Other.Depth), Val(Other.Val) {}
+  DCLink(const DCLink &Other) : DCLinkBase(Other.Loc, Other.Lvl, Other.IsStore, Other.IsLoad, Other.Depth), Val(Other.Val) {}
 
   Instruction *Val;
 
-  bool isCall() const { return CallInst::classof(Val); }
+  bool isCall() const { return CallInst::classof(Val) && !isLKMMStore(Val) && !isLKMMLoad(Val); }
   bool isRet() const { return ReturnInst::classof(Val); }
   bool isCtrl() const { return BranchInst::classof(Val); }
+  bool isBeg() const { return isLKMMLoad(Val); }
+  bool isEnd() const { return isLKMMStore(Val); }
+  bool isRMW() const { return isLKMMLoad(Val) && isLKMMStore(Val); }
 
   bool operator==(const DCLinkBase &Other) const override {
     const auto &O = static_cast<const DCLink &>(Other);
@@ -662,7 +698,7 @@ public:
   ~DCLink() = default;
 
   // Convenience copy constructor
-  DCLink(const LKMMSearchPolicy::DCLink &Other) : DCLinkBase(Other.Loc.value().get(), Other.Lvl, Other.getDepth()), F(Other.Val->getFunction()->getName()), Type(DCLinkType::VALUE) {
+  DCLink(const LKMMSearchPolicy::DCLink &Other) : DCLinkBase(Other.Loc.value().get(), Other.Lvl, Other.isEnd(), Other.isBeg(), Other.getDepth()), F(Other.Val->getFunction()->getName()), Type(DCLinkType::VALUE) {
     if (Other.isCall()) Type = DCLinkType::CALL;
     if (Other.isRet()) Type = DCLinkType::RETURN;
     if (Other.isCtrl()) Type = DCLinkType::CONTROL;
@@ -672,6 +708,9 @@ public:
   bool isCall() const { return Type == DCLinkType::CALL; }
   bool isRet() const { return Type == DCLinkType::RETURN; }
   bool isCtrl() const { return Type == DCLinkType::CONTROL; }
+  bool isBeg() const { return IsLoad; }
+  bool isEnd() const { return IsStore; }
+  bool isRMW() const { return IsLoad && IsStore; }
 
   bool operator==(const DCLinkBase &Other) const override {
     const auto &O = static_cast<const DCLink &>(Other);
@@ -1190,6 +1229,8 @@ public:
     this->runSearch();
   }
 
+  void completeSegWithLoad(Instruction *I);
+
   // Merges all segments to full dependency chains of length Depth.
   void merge(const size_t &Depth) {
     buildTransitiveClosure(Depth);
@@ -1611,6 +1652,23 @@ void BUCtx<DT>::handleBranch(BasicBlock *NextBB) {
   }
 }
 
+template<DepType DT>
+void LKMMSearchPolicy::AnnotCtx<DT>::completeSegWithLoad(Instruction *I) {
+  auto Curr = getDCPtr();
+  auto Cpy = std::make_unique<DC>(*Curr);
+
+  setNewDc(std::move(Cpy));
+  getDc().addLink(I, DCLevel::PTR);
+  if (Curr->Chain.front().isRet())
+    makeIntactDep<0, -1>();
+  else if (Curr->Chain.front().isCall())
+    makeIntactDep<0, 1>();
+  else
+    makeIntactDep<0, 0>();
+
+  setNewDc(std::move(Curr));
+}
+
 template <DepType DT>
 void BUCtx<DT>::visit(Value *V) {
   auto *Ann = (LKMMSearchPolicy::AnnotCtx<DT> *)this;
@@ -1698,6 +1756,22 @@ void BUCtx<DT>::visitBasicBlock(BasicBlock &BB) {
 
           PtrOrVal = LI->getPointerOperand();
         }
+        if (auto *CI = dyn_cast<CallInst>(&I)) {
+          if (isLKMMLoad(CI)) {
+            if (CI->isInlineAsm()) {
+              if (CI->getNumOperands() < 2) {
+                continue;
+              }
+              PtrOrVal = CI->getArgOperand(0);
+
+            } else {
+              PtrOrVal = CI->getArgOperand(0);
+            }
+          }
+          if (isLKMMStore(CI)) {
+            PtrOrVal = CI->getArgOperand(0);
+          }
+        }
 
         if (PtrOrVal) {
 
@@ -1710,14 +1784,13 @@ void BUCtx<DT>::visitBasicBlock(BasicBlock &BB) {
       if constexpr (DT == DepType::DATA) {
         // Data dependencies end in a volatile store
         // with the data operand being the end of the chain.
-        if (auto *SI = dyn_cast<StoreInst>(&I)) {
-          if (!SI->isVolatile())
-            continue;
-          MDNode *Existing = SI->getMetadata(LLVMContext::MD_lkmm_primitive);
-          if (!Existing)
-            continue;
-
-          PtrOrVal = SI->getValueOperand();
+        if (isLKMMStore(&I)) {
+          if (auto *SI = dyn_cast<StoreInst>(&I)) {
+            PtrOrVal = SI->getValueOperand();
+          }
+          if (auto *CI = dyn_cast<CallInst>(&I)) {
+            PtrOrVal = CI->getArgOperand(1);
+          }
         }
         if (PtrOrVal) {
 
@@ -1806,6 +1879,8 @@ void BUCtx<DepType::CTRL>::visitBasicBlock(BasicBlock &BB) {
     for (auto &I : BB) {
 
       if (auto *CI = dyn_cast<CallInst>(&I)) {
+        if (isLKMMStore(CI)) continue;
+
         auto End = std::make_unique<DC<LKMMSearchPolicy>>();
         End->addLink(CI, DCLevel::EMPTY, -1);
         Ann->setNewDc(std::move(End));
@@ -1835,14 +1910,9 @@ void BUCtx<DepType::CTRL>::visitBasicBlock(BasicBlock &BB) {
   if (Ann->currPass() == LKMMSearchPolicy::AnnotCtx<DT>::Pass::Any_End) {
     for (auto &I : BB) {
 
-      if (auto *SI = dyn_cast<StoreInst>(&I)) {
-        if (!SI->isVolatile())
-          continue;
-        MDNode *Existing = SI->getMetadata(LLVMContext::MD_lkmm_primitive);
-        if (!Existing)
-          continue;
+      if (isLKMMStore(&I)) {
         auto End = std::make_unique<DC<LKMMSearchPolicy>>();
-        End->addLink(SI, DCLevel::EMPTY);
+        End->addLink(&I, DCLevel::EMPTY);
         Ann->setNewDc(std::move(End));
         // Add Beg immediatly
         if (!F->hasUseList())
@@ -1904,9 +1974,9 @@ void BUCtx<DT>::visitArgument(Argument *A) {
       Ann->setNewDc(std::move(Cpy));
       Ann->getDc().addLink(CI, getLastNonEmptyLvl(Curr->Chain), A->getArgNo());
 
-      if (auto *_ = dyn_cast<ReturnInst>(Curr->Chain.front().Val))
+      if (Curr->Chain.front().isRet())
         Ann->template makeIntactDep<-1, -1>();
-      else if (auto *_ = dyn_cast<CallInst>(Curr->Chain.front().Val))
+      else if (Curr->Chain.front().isCall())
         Ann->template makeIntactDep<-1, 1>();
       else
         Ann->template makeIntactDep<-1, 0>();
@@ -1938,25 +2008,11 @@ void BUCtx<DT>::visitStore(StoreInst &SI) {
 
 template <DepType DT>
 void BUCtx<DT>::visitLoad(LoadInst &LI) {
-  MDNode *Existing = LI.getMetadata(LLVMContext::MD_lkmm_primitive);
-  if (LI.isVolatile() && Existing) {
+  if (isLKMMLoad(&LI)) {
     // We found an internal beginning!
     LKMMSearchPolicy::AnnotCtx<DT> *Ann = static_cast<LKMMSearchPolicy::AnnotCtx<DT> *>(this);
 
-    // Save a copy without the load
-    auto Curr = Ann->getDCPtr();
-    auto Cpy = std::make_unique<DC<LKMMSearchPolicy>>(*Curr);
-
-    Ann->setNewDc(std::move(Cpy));
-    Ann->getDc().addLink(&LI, DCLevel::PTR);
-    if (auto *_ = dyn_cast<ReturnInst>(Curr->Chain.front().Val))
-      Ann->template makeIntactDep<0, -1>();
-    else if (auto *_ = dyn_cast<CallInst>(Curr->Chain.front().Val))
-      Ann->template makeIntactDep<0, 1>();
-    else
-      Ann->template makeIntactDep<0, 0>();
-
-    Ann->setNewDc(std::move(Curr));
+    Ann->completeSegWithLoad(&LI);
   }
   goThroughMem(LI);
 }
@@ -1990,26 +2046,15 @@ void BUCtx<DepType::CTRL>::searchInScope(Instruction &B) {
     if (Ann->getPDT().dominates(&BB, Cond->getParent()))
       continue;
 
-    // All branches lead to BB -> syntactic dependency at best
-    // TODO: compund conditions
-    //if (IsAlwaysReachable)
-    //  continue;
-
     for (auto &I : BB) {
-      if (auto *SI = dyn_cast<StoreInst>(&I)) {
-        if (!SI->isVolatile())
-          continue;
-        MDNode *Existing = SI->getMetadata(LLVMContext::MD_lkmm_primitive);
-        if (!Existing)
-          continue;
-
+      if (isLKMMStore(&I)) {
         auto Curr = Ann->getDCPtr();
         auto Cpy = std::make_unique<DC<LKMMSearchPolicy>>(*Curr);
 
         if (auto *_ = dyn_cast<ReturnInst>(&B)) {
           DataAC.setNewDc(std::move(Cpy));
           DataAC.getDc().addLink(&B, getLastNonEmptyLvl(Curr->Chain));
-          DataAC.getDc().insertLink(SI, DCLevel::PTE);
+          DataAC.getDc().insertLink(&I, DCLevel::PTE);
           DataAC.makeIntactDep<1, 0>();
 
           Ann->setNewDc(std::move(Curr));
@@ -2018,11 +2063,11 @@ void BUCtx<DepType::CTRL>::searchInScope(Instruction &B) {
 
         Ann->setNewDc(std::move(Cpy));
         Ann->getDc().addLink(&B, DCLevel::PTE);
-        Ann->getDc().insertLink(SI, DCLevel::PTE);
+        Ann->getDc().insertLink(&I, DCLevel::PTE);
 
-        if (auto *_ = dyn_cast<LoadInst>(&B))
+        if (isLKMMLoad(&B))
           Ann->makeIntactDep<0, 0>();
-        else if (auto *_ = dyn_cast<CallInst>(&B))
+        else if (isa<CallInst>(&B))
           Ann->makeIntactDep<-1, 0>();
         else
           llvm_unreachable("Unexpected instruction heading ctrl dependency chain");
@@ -2071,8 +2116,7 @@ void BUCtx<DepType::CTRL>::searchInScope(Instruction &B) {
 
 template <>
 void BUCtx<DepType::CTRL>::visitLoad(LoadInst &LI) {
-  MDNode *Existing = LI.getMetadata(LLVMContext::MD_lkmm_primitive);
-  if (!LI.isVolatile() || !Existing) {
+  if (!isLKMMLoad(&LI)) {
     goThroughMem(LI);
     return;
   }
@@ -2198,6 +2242,12 @@ void BUCtx<DT>::visitCallInst(CallInst &CI) {
 
   auto *Ann = (LKMMSearchPolicy::AnnotCtx<DT> *)this;
 
+  // This could also be a call to an atomic or asm
+  if (isLKMMLoad(&CI)) {
+    Ann->completeSegWithLoad(&CI);
+    return;
+  }
+
   // We found segments that may dangle!
   // Add a new segment for all returns in the callee.
 
@@ -2218,10 +2268,10 @@ void BUCtx<DT>::visitCallInst(CallInst &CI) {
         Ann->setNewDc(std::move(Cpy));
         Ann->getDc().addLink(RI, getLastNonEmptyLvl(Curr->Chain));
 
-        auto *End = Ann->getDc().Chain.front().Val;
-        if (auto *_ = dyn_cast<ReturnInst>(End))
+        auto &End = Ann->getDc().Chain.front();
+        if (End.isRet())
           Ann->template makeIntactDep<1, -1>();
-        else if (auto *_ = dyn_cast<CallInst>(End))
+        else if (End.isCall())
           Ann->template makeIntactDep<1, 1>();
         else
           Ann->template makeIntactDep<1, 0>();
@@ -2612,6 +2662,14 @@ void LKMMAnnotatePrimitives::transform(Function &F) {
   for (auto &BB : F) {
     for (auto I = BB.begin(); I != BB.end(); ++I ) {
       if (auto *CI = dyn_cast<CallInst>(&*I)) {
+        if(CI->isInlineAsm()) {
+          auto *Ty = CI->getFunctionType();
+          if (Ty->getNumParams() > 0 || Ty->getNumParams() < 4)
+            I->addAnnotationMetadata("lkmm_store");
+          if (!Ty->getReturnType()->isVoidTy() && (Ty->getNumParams() > 0 || Ty->getNumParams() < 4))
+            I->addAnnotationMetadata("lkmm_load");
+          goto isAsm;
+        }
         auto *Callee = CI->getCalledFunction();
         if (!Callee)
           goto isAsm;
@@ -2629,14 +2687,14 @@ void LKMMAnnotatePrimitives::transform(Function &F) {
 
           if (!begins(Name)) {
           //auto *It = std::find_if_not(Annotations.begin(), Annotations.end(), [Annot](StringRef A) { return std::strncmp(A.data(), Annot.data(), Annot.size()); });
-            assert(Annotations.back() == Annot && "Mismatched annotation");
+            assert(std::strncmp(Annotations.back().data(), Annot.data(), Annot.size()) == 0 && "Mismatched annotation");
 
             // FIXME: remove leftover load agg.tmp if this was an aggExpr?
             // should be taken care of by DCE anyways
             if (Callee->isIntrinsic()) {
 
-              if (auto *I = dyn_cast<Instruction>(CI->getArgOperand(0)))
-                I->addAnnotationMetadata("lkmm_load");
+              //if (auto *I = dyn_cast<Instruction>(CI->getArgOperand(0)))
+              //  I->addAnnotationMetadata("lkmm_load");
               CI->replaceAllUsesWith(CI->getArgOperand(0));
             }
 
@@ -2804,6 +2862,9 @@ PreservedAnalyses LKMMAnnotatePrimitives::run(Module &M,
 
           if (!CI->getType()->isVoidTy())
             CI->addAnnotationMetadata("lkmm_load");
+          auto *Ty = F.getFunctionType();
+          if (Ty->getNumParams() == 2)
+            CI->addAnnotationMetadata("lkmm_store");
         }
       }
     }

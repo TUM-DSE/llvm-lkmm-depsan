@@ -68,8 +68,8 @@ enum CtxKind { CK_Annot, CK_Ver };
 
 class DCLinkBase {
 public:
-  DCLinkBase(std::optional<DebugLoc> Loc, DCLevel Lvl, int Depth)
-      : Loc(Loc), Lvl(Lvl), Depth(Depth) {}
+  DCLinkBase(std::optional<DebugLoc> Loc, DCLevel Lvl, bool S, bool L, int Depth)
+      : Loc(Loc), Lvl(Lvl), IsStore(S), IsLoad(L), Depth(Depth) {}
 
   //DCLinkBase(const DCLinkBase &Other) : Loc(Other.Loc), Lvl(Other.Lvl), Depth(Other.Depth) {}
   virtual ~DCLinkBase() = default;
@@ -79,6 +79,9 @@ public:
 
   bool isCall() const;
   bool isRet() const;
+  bool isBegin() const;
+  bool isEnd() const;
+  bool isRMW() const;
 
   void addDepth(int Delta) { Depth += Delta; }
   int getDepth() const { return Depth; }
@@ -86,6 +89,8 @@ public:
   virtual bool operator==(const DCLinkBase &Other) const = 0;
 
 protected:
+  bool IsStore;
+  bool IsLoad;
   int Depth;
 };
 

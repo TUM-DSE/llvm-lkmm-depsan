@@ -2042,6 +2042,8 @@ void BUCtx<DepType::CTRL>::searchInScope(Instruction &B) {
 
     // if (!IsReachableOnce)
     //   continue;
+    if (!isPotentiallyReachable(Cond->getParent(), &BB))
+      continue;
 
     if (Ann->getPDT().dominates(&BB, Cond->getParent()))
       continue;
@@ -2659,7 +2661,7 @@ bool LKMMAnnotatePrimitives::guessIsStore(CallInst *CI) {
   // The inline asm usually has the ptr first
   if (CI->isInlineAsm()) {
     auto *Ty = CI->getFunctionType();
-    if (Ty->getNumParams() > 1 || Ty->getNumParams() < 4)
+    if (Ty->getNumParams() > 1 && Ty->getNumParams() < 4)
       if (Ty->getParamType(0)->isPointerTy())
         return true;
     return false;

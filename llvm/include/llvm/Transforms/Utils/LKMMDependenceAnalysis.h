@@ -661,6 +661,9 @@ private:
   bool getAtomicAnnot(StringRef Name, const StringRef **Attr);
   bool getPrimitiveAnnot(StringRef Name, StringRef *Attr);
   bool begins(StringRef Name);
+
+  bool guessIsStore(CallInst *CI);
+  bool guessIsLoad(CallInst *CI);
 };
 
 //===----------------------------------------------------------------------===//

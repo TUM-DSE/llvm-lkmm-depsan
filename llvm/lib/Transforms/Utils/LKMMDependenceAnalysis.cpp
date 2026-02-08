@@ -2653,6 +2653,49 @@ bool LKMMAnnotatePrimitives::getPrimitiveAnnot(StringRef Name, StringRef *Attr) 
   return false;
 }
 
+bool LKMMAnnotatePrimitives::guessIsStore(CallInst *CI) {
+
+  // Linux' atomic helpers have type F (val, ptr, ...)
+  // The inline asm usually has the ptr first
+  if (CI->isInlineAsm()) {
+    auto *Ty = CI->getFunctionType();
+    if (Ty->getNumParams() > 1 || Ty->getNumParams() < 4)
+      if (Ty->getParamType(0)->isPointerTy())
+        return true;
+    return false;
+  }
+
+  return false;
+  // auto *Callee = CI->getCalledFunction();
+  // if (!Callee)
+  //   return false;
+
+  // const StringRef *Annot = nullptr;
+  // return getAtomicAnnot(Callee->getName(), &Annot);
+
+}
+bool LKMMAnnotatePrimitives::guessIsLoad(CallInst *CI) {
+
+  // Linux' atomic helpers have type F (val, ptr, ...)
+  // The inline asm usually has the ptr first
+  if (CI->isInlineAsm()) {
+    auto *Ty = CI->getFunctionType();
+    if (Ty->getNumParams() > 0 && !Ty->getReturnType()->isVoidTy())
+      if (Ty->getParamType(0)->isPointerTy())
+        return true;
+    return false;
+  }
+
+  return false;
+  // auto *Callee = CI->getCalledFunction();
+  // if (!Callee)
+  //   return false;
+
+  // const StringRef *Annot = nullptr;
+  // return getAtomicAnnot(Callee->getName(), &Annot);
+
+}
+
 void LKMMAnnotatePrimitives::transform(Function &F) {
 
   SmallVector<StringRef, 3> Annotations;
@@ -2662,14 +2705,15 @@ void LKMMAnnotatePrimitives::transform(Function &F) {
   for (auto &BB : F) {
     for (auto I = BB.begin(); I != BB.end(); ++I ) {
       if (auto *CI = dyn_cast<CallInst>(&*I)) {
-        if(CI->isInlineAsm()) {
-          auto *Ty = CI->getFunctionType();
-          if (Ty->getNumParams() > 0 || Ty->getNumParams() < 4)
-            I->addAnnotationMetadata("lkmm_store");
-          if (!Ty->getReturnType()->isVoidTy() && (Ty->getNumParams() > 0 || Ty->getNumParams() < 4))
-            I->addAnnotationMetadata("lkmm_load");
+        if(guessIsStore(CI)) {
+          CI->addAnnotationMetadata("lkmm_store");
           goto isAsm;
         }
+        if(guessIsLoad(CI)) {
+          CI->addAnnotationMetadata("lkmm_load");
+          goto isAsm;
+        }
+
         auto *Callee = CI->getCalledFunction();
         if (!Callee)
           goto isAsm;
@@ -2860,12 +2904,9 @@ PreservedAnalyses LKMMAnnotatePrimitives::run(Module &M,
             Meta = MDNode::concatenate(Existing, Meta);
           CI->setMetadata(LLVMContext::MD_lkmm_primitive, Meta);
 
-          if (!CI->getType()->isVoidTy())
-            CI->addAnnotationMetadata("lkmm_load");
-          auto *Ty = F.getFunctionType();
-          if (Ty->getNumParams() == 2)
-            CI->addAnnotationMetadata("lkmm_store");
-        }
+          // if (!CI->getType()->isVoidTy())
+          //   CI->addAnnotationMetadata("lkmm_load");
+          // CI->addAnnotationMetadata("lkmm_store");
       }
     }
 

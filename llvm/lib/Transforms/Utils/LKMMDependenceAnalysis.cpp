@@ -179,12 +179,12 @@ MK_COUNTS(Combined)
 
 MK_STATS(Combined)
 
-#define MAX_SIZE_PER_BUCKET 10000
-#define MAX_CHAIN_LENGTH    100
+#define MAX_SIZE_PER_BUCKET 2000
+#define MAX_CHAIN_LENGTH    500
 #define MAX_VISITED_LINKS   100000
 #define MAX_CHAINS_PER_INST 1000
 #define MAX_PREV_STORES     5
-#define MAX_PHIS            3
+#define MAX_PHIS            5
 
 static int OutFD[2] = {2, 2};
 static size_t LinksVisited = 0;
@@ -1006,21 +1006,35 @@ void SegmentGraph::enumeratePaths(size_t i, void (*AnnoFn)(const SegmentID<0,0, 
 
       WorkSet.push_back(Pop);
       for (auto *S : Curr->Successors) {
+        if (S->E != 0 && Path.size()==i-1) continue;
+
+        if (std::find(Path.begin(), Path.end(), S) != Path.end()) {
+          // errs() << "Ignoring recursion" << "\n";
+          continue;
+        }
+
         // If this segment returns, we only add successors returning to the top of the stack
         if (Curr->E == 1 && !CallStack.empty()) {
-          if (Curr->B == 1) {
-             auto *Seg = static_cast<SegmentID<1, 1, LKMMSearchPolicy> *>(Curr->Seg);
-             if (Seg->getDC().Chain.back().Val->getFunction() == CallStack.back()) {
+          if (S->B == -1) {
+            if (S->E == 1) {
+             auto *Seg = static_cast<SegmentID<-1, 1, LKMMSearchPolicy> *>(S->Seg);
+             if (Seg->getDC().Chain.front().Val->getFunction() == CallStack.back()) {
                 WorkSet.push_back(S);
              }
-          } else if (Curr->B == -1){
-             auto *Seg = static_cast<SegmentID<-1, 1, LKMMSearchPolicy> *>(Path.back()->Seg);
-             if (Seg->getDC().Chain.back().Val->getFunction() == CallStack.back()) {
+            } else if (S->E == -1){
+             auto *Seg = static_cast<SegmentID<-1, -1, LKMMSearchPolicy> *>(S->Seg);
+             if (Seg->getDC().Chain.front().Val->getFunction() == CallStack.back()) {
                 WorkSet.push_back(S);
              }
-          } else {
-            llvm_unreachable("Invalid segment type: <0, 1> should not hava a stack");
+            } else {
+             auto *Seg = static_cast<SegmentID<-1, 0, LKMMSearchPolicy> *>(S->Seg);
+             if (Seg->getDC().Chain.front().Val->getFunction() == CallStack.back()) {
+                WorkSet.push_back(S);
+             }
+            }
           }
+        } else {
+          WorkSet.push_back(S);
         }
       }
       if (Curr->E == 1 && !CallStack.empty()) CallStack.pop_back();

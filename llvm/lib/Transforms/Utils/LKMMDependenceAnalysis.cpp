@@ -962,6 +962,7 @@ void SegmentGraph::enumeratePaths(size_t i, void (*AnnoFn)(const SegmentID<0,0, 
     // We track calls, so we limit where we can return to.
     // But on an empty stack we can return to anywhere.
     SmallVector<Function *, 8> CallStack = {};
+    SmallVector<Function *, 8> ReturnStack = {};
 
     SegmentNode *Pop = nullptr;
 
@@ -971,12 +972,15 @@ void SegmentGraph::enumeratePaths(size_t i, void (*AnnoFn)(const SegmentID<0,0, 
 
       if (Curr == Pop) {
         WorkSet.pop_back();
-        Path.pop_back();
-        continue;
+        goto pop;
+      } else {
+        auto *dbg = static_cast<SegmentID<0, 0, LKMMSearchPolicy> *>(Curr->Seg);
+        errs() << dbg->getDC().Chain.front().Val->getFunction()->getName();
       }
 
       Path.push_back(Curr);
       WorkSet.pop_back();
+
 
       // If we just came to this segment by call, we put the caller on the stack
       if (Curr->B == -1) {
@@ -991,6 +995,9 @@ void SegmentGraph::enumeratePaths(size_t i, void (*AnnoFn)(const SegmentID<0,0, 
            CallStack.push_back(Seg->getDC().Chain.back().Val->getFunction());
         }
       }
+      // If we came here by return, pop the call stack but remember it
+      // so we can add it back when the path gets shorter
+      if (Curr->B == 1 && !CallStack.empty()) ReturnStack.push_back(CallStack.pop_back_val());
 
       if (Path.back()->E == 0) {
         // We reached a leaf node, annotate the path
@@ -1014,20 +1021,20 @@ void SegmentGraph::enumeratePaths(size_t i, void (*AnnoFn)(const SegmentID<0,0, 
         }
 
         // If this segment returns, we only add successors returning to the top of the stack
-        if (Curr->E == 1 && !CallStack.empty()) {
-          if (S->B == -1) {
+        if (Curr->E == -1 && !CallStack.empty()) {
+          if (S->B == 1) {
             if (S->E == 1) {
-             auto *Seg = static_cast<SegmentID<-1, 1, LKMMSearchPolicy> *>(S->Seg);
+             auto *Seg = static_cast<SegmentID<1, 1, LKMMSearchPolicy> *>(S->Seg);
              if (Seg->getDC().Chain.front().Val->getFunction() == CallStack.back()) {
                 WorkSet.push_back(S);
              }
             } else if (S->E == -1){
-             auto *Seg = static_cast<SegmentID<-1, -1, LKMMSearchPolicy> *>(S->Seg);
+             auto *Seg = static_cast<SegmentID<1, -1, LKMMSearchPolicy> *>(S->Seg);
              if (Seg->getDC().Chain.front().Val->getFunction() == CallStack.back()) {
                 WorkSet.push_back(S);
              }
             } else {
-             auto *Seg = static_cast<SegmentID<-1, 0, LKMMSearchPolicy> *>(S->Seg);
+             auto *Seg = static_cast<SegmentID<1, 0, LKMMSearchPolicy> *>(S->Seg);
              if (Seg->getDC().Chain.front().Val->getFunction() == CallStack.back()) {
                 WorkSet.push_back(S);
              }
@@ -1037,11 +1044,12 @@ void SegmentGraph::enumeratePaths(size_t i, void (*AnnoFn)(const SegmentID<0,0, 
           WorkSet.push_back(S);
         }
       }
-      if (Curr->E == 1 && !CallStack.empty()) CallStack.pop_back();
       continue;
 
     pop:
-      Path.pop_back();
+      auto *popped = Path.pop_back_val();
+      if (popped->B == -1) CallStack.pop_back();
+      if (popped->B == 1 && !ReturnStack.empty()) CallStack.push_back(ReturnStack.pop_back_val());
     }
   }
 }
@@ -1125,19 +1133,15 @@ public:
   // FIXME: is this "conditional"?
   void visitPHINode(PHINode &PN);
 
-  void visitTruncInst(TruncInst &TI) {};
-
-  void visitZExtInst(ZExtInst &ZI) {};
-
-  void visitSExtInst(SExtInst &SI);
-
-  void visitPtrToIntInst(PtrToIntInst &PTI) {};
-
-  void visitIntToPtrInst(IntToPtrInst &ITPI) {};
-
-  void visitBitCastInst(BitCastInst &BCI) {};
-
-  void visitAddrSpaceCastInst(AddrSpaceCastInst &ASCI) {};
+  void visitCastInst(CastInst &CstI);
+  // Handled by the above
+  //void visitPtrToIntInst(PtrToIntInst &PTI) {};
+  //void visitIntToPtrInst(IntToPtrInst &ITPI) {};
+  //void visitBitCastInst(BitCastInst &BCI) {};
+  //void visitAddrSpaceCastInst(AddrSpaceCastInst &ASCI) {};
+  //void visitZExtInst(ZExtInst &ZI) {};
+  //void visitSExtInst(SExtInst &SI);
+  //void visitTruncInst(TruncInst &TI) {};
 
   void visitSelectInst(SelectInst &SI);
 
@@ -2022,12 +2026,23 @@ void BUCtx<DT>::visitStore(StoreInst &SI) {
 
 template <DepType DT>
 void BUCtx<DT>::visitLoad(LoadInst &LI) {
+  LKMMSearchPolicy::AnnotCtx<DT> *Ann = static_cast<LKMMSearchPolicy::AnnotCtx<DT> *>(this);
   if (isLKMMLoad(&LI)) {
     // We found an internal beginning!
-    LKMMSearchPolicy::AnnotCtx<DT> *Ann = static_cast<LKMMSearchPolicy::AnnotCtx<DT> *>(this);
-
     Ann->completeSegWithLoad(&LI);
   }
+
+  // First check where the address comes from
+  auto Curr = Ann->getDCPtr();
+  auto Cpy = std::make_unique<DC<LKMMSearchPolicy>>(*Curr);
+
+  Ann->setNewDc(std::move(Cpy));
+  Ann->getDc().addLink(&LI, getLastNonEmptyLvl(Ann->getDc().Chain));
+  visit(LI.getPointerOperand());
+
+  Ann->setNewDc(std::move(Curr));
+
+  // Then check where the value comes from
   goThroughMem(LI);
 }
 
@@ -2323,10 +2338,10 @@ void BUCtx<DT>::visitUnaryOperator(UnaryOperator &UO) {
 }
 
 template <DepType DT>
-void BUCtx<DT>::visitSExtInst(SExtInst &SI) {
+void BUCtx<DT>::visitCastInst(CastInst &CstI) {
   auto *Ann = (LKMMSearchPolicy::AnnotCtx<DT> *)this;
-  Ann->getDc().addLink(&SI, getLastNonEmptyLvl(Ann->getDc().Chain));
-  visit(SI.getOperand(0));
+  Ann->getDc().addLink(&CstI, getLastNonEmptyLvl(Ann->getDc().Chain));
+  visit(CstI.getOperand(0));
 }
 
 template <DepType DT>
@@ -2552,7 +2567,7 @@ llvm::LKMMAnnotateDeps::DepMap *LKMMSearchPolicy::LKMMAnnotator::run(Module &M, 
   FOR_EACH_DEP(REMOVE_DUP);
 #undef REMOVE_DUP
 
-  AC.merge(12);
+  AC.merge(15);
   return AC.getResult();
 }
 

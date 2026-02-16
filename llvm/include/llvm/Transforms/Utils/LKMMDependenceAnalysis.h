@@ -19,6 +19,7 @@
 #include <set>
 #include <type_traits>
 #include <unordered_set>
+#include <variant>
 
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/Statistic.h"
@@ -458,6 +459,17 @@ public:
 
   class LKMMAnnotator;
 };
+
+using AnySeg = std::variant<
+  SegmentID<0, 1, LKMMSearchPolicy>,
+  SegmentID<0, -1, LKMMSearchPolicy>,
+  SegmentID<0, 0, LKMMSearchPolicy>,
+  SegmentID<1, 1, LKMMSearchPolicy>,
+  SegmentID<1, -1, LKMMSearchPolicy>,
+  SegmentID<1, 0, LKMMSearchPolicy>,
+  SegmentID<-1, 1, LKMMSearchPolicy>,
+  SegmentID<-1, -1, LKMMSearchPolicy>,
+  SegmentID<-1, 0, LKMMSearchPolicy>>;
 
 class SegmentNode {
 public:

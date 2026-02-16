@@ -1290,18 +1290,34 @@ public:
       auto *CallingInstr = cast<CallInst>(CurrDC->Chain.back().Val);
       auto *Caller = CallingInstr->getFunction();
 
-      Caller->addFnAttr(Attribute::get(Caller->getContext(), calls<DT>()));
-      this->F->addFnAttr(Attribute::get(this->F->getContext(), takes<DT>()));
-      if (CurrDC->ArgB.value() >= 0)
-        this->F->addParamAttr(CurrDC->ArgB.value(), Attribute::get(this->F->getContext(), is<DT>()));
+      if constexpr (DT != DepType::CTRL) {
+        Caller->addFnAttr(Attribute::get(Caller->getContext(), calls<DT>()));
+        this->F->addFnAttr(Attribute::get(this->F->getContext(), takes<DT>()));
+        if (CurrDC->ArgB.value() >= 0)
+          this->F->addParamAttr(CurrDC->ArgB.value(), Attribute::get(this->F->getContext(), is<DT>()));
+      } else {
+        if (CurrDC->ArgB.value() >= 0) {
+          Caller->addFnAttr(Attribute::get(Caller->getContext(), calls<DepType::DATA>()));
+          this->F->addFnAttr(Attribute::get(this->F->getContext(), takes<DepType::DATA>()));
+          this->F->addParamAttr(CurrDC->ArgB.value(), Attribute::get(this->F->getContext(), is<DepType::DATA>()));
+        } else {
+          Caller->addFnAttr(Attribute::get(Caller->getContext(), calls<DT>()));
+          this->F->addFnAttr(Attribute::get(this->F->getContext(), takes<DT>()));
+        }
+      }
     }
 
     if constexpr (B == 1) {
       // Attention! The beginning return returns to F and
       // definitely returns to it (else everything we just traversed is unreachable).
 
+      // We cannot return ctrl deps ever
       auto *Callee = cast<ReturnInst>(CurrDC->Chain.back().Val)->getFunction();
-      Callee->addRetAttr(Attribute::get(this->F->getContext(), returns<DT>()));
+      if constexpr (DT != DepType::CTRL) {
+        Callee->addRetAttr(Attribute::get(this->F->getContext(), returns<DT>()));
+      } else {
+        Callee->addRetAttr(Attribute::get(this->F->getContext(), returns<DepType::DATA>()));
+      }
       // TODO: Warn about external function/intrinsic
     }
 
@@ -1970,6 +1986,115 @@ void BUCtx<DepType::CTRL>::visitICmpInst(ICmpInst &ICI) {
   }
 }
 
+template<>
+void BUCtx<DepType::CTRL>::searchInScope(Instruction &B) {
+
+  auto *Ann = (LKMMSearchPolicy::AnnotCtx<DepType::CTRL> *)this;
+  auto *Cond = cast<BranchInst>(Ann->getDc().Chain.front().Val);
+
+  // if we come here from visitArg, we don't add B since this has already been done
+  // otherwise we lose the ArgNo
+  bool BeginsWCall = isa<CallInst>(B);
+
+  //LKMMSearchPolicy::AnnotCtx<DepType::DATA> DataAC(Ann->getKind(), Ann->AnnotateFn, Ann->PrevResult);
+  //DataAC.populate(Ann->I, Ann->R, Ann->MD, Ann->D, Ann->RD, Ann->MDD, Ann->MR, Ann->MRR, Ann->MRMD);
+  //DataAC.setF(Ann->F);
+
+  for (auto &BB: *(Cond->getFunction())) {
+
+    if (Cond == BB.getTerminator())
+      continue;
+
+    // bool IsAlwaysReachable = true;
+    // bool IsReachableOnce = false;
+    // for (auto *Succ: Cond->successors()) {
+    //   bool tmp = isPotentiallyReachable(Succ, &BB);
+    //   IsAlwaysReachable &= tmp;
+    //   IsReachableOnce |= tmp; // false positives!
+    // }
+
+    // if (!IsReachableOnce)
+    //   continue;
+    if (!isPotentiallyReachable(Cond->getParent(), &BB))
+      continue;
+
+    if (Ann->getPDT().dominates(&BB, Cond->getParent()))
+      continue;
+
+    for (auto &I : BB) {
+      if (isLKMMStore(&I)) {
+        auto Curr = Ann->getDCPtr();
+        auto Cpy = std::make_unique<DC<LKMMSearchPolicy>>(*Curr);
+
+        //if (isa<ReturnInst>(&B)) {
+        //  Ann->setNewDc(std::move(Cpy));
+        //  Ann->getDc().addLink(&B, getLastNonEmptyLvl(Curr->Chain));
+        //  Ann->getDc().insertLink(&I, DCLevel::PTE);
+        //  Ann->makeIntactDep<1, 0>();
+
+        //  Ann->setNewDc(std::move(Curr));
+        //  continue;
+        //}
+
+        Ann->setNewDc(std::move(Cpy));
+        if (!BeginsWCall)
+          Ann->getDc().addLink(&B, getLastNonEmptyLvl(Curr->Chain));
+        Ann->getDc().insertLink(&I, DCLevel::PTE);
+
+        if (isLKMMLoad(&B))
+          Ann->makeIntactDep<0, 0>();
+        else if (BeginsWCall)
+          Ann->makeIntactDep<-1, 0>();
+        else if (isa<ReturnInst>(&B))
+          Ann->makeIntactDep<1, 0>();
+        else
+          llvm_unreachable("Unexpected instruction heading ctrl dependency chain");
+
+        Ann->setNewDc(std::move(Curr));
+      }
+      if (auto *CI = dyn_cast<CallInst>(&I)) {
+
+        auto *Callee = CI->getCalledFunction();
+        if (!Callee)
+          continue;
+
+        auto Curr = Ann->getDCPtr();
+        auto Cpy = std::make_unique<DC<LKMMSearchPolicy>>(*Curr);
+
+        //if (auto *_ = dyn_cast<ReturnInst>(&B)) {
+        //  Callee->addFnAttr(takes<DepType::DATA>());
+
+        //  DataAC.setNewDc(std::move(Cpy));
+        //  DataAC.getDc().addLink(&B, getLastNonEmptyLvl(Curr->Chain));
+        //  DataAC.getDc().insertLink(CI, DCLevel::PTE, -1);
+        //  DataAC.makeIntactDep<1, 1>();
+
+        //  Ann->setNewDc(std::move(Curr));
+        //  continue;
+        //}
+
+        Ann->setNewDc(std::move(Cpy));
+        if (!BeginsWCall)
+          Ann->getDc().addLink(&B, DCLevel::PTE);
+        Ann->getDc().insertLink(CI, DCLevel::BOTH, -1);
+
+        if (isLKMMLoad(&B))
+          Ann->makeIntactDep<0, 1>();
+        else if (BeginsWCall)
+          Ann->makeIntactDep<-1, 1>();
+        else if (isa<ReturnInst>(&B))
+          Ann->makeIntactDep<1, 1>();
+        else
+          llvm_unreachable("Unexpected instruction heading ctrl dependency chain");
+
+        Ann->setNewDc(std::move(Curr));
+      }
+    }
+  }
+
+  return;
+}
+
 template <DepType DT>
 void BUCtx<DT>::visitArgument(Argument *A) {
   LKMMSearchPolicy::AnnotCtx<DT> *Ann = static_cast<LKMMSearchPolicy::AnnotCtx<DT> *>(this);
@@ -1991,6 +2116,13 @@ void BUCtx<DT>::visitArgument(Argument *A) {
 
       Ann->setNewDc(std::move(Cpy));
       Ann->getDc().addLink(CI, getLastNonEmptyLvl(Curr->Chain), A->getArgNo());
+
+      if constexpr (DT == DepType::CTRL) {
+        ((LKMMSearchPolicy::AnnotCtx<DepType::CTRL> *)this)->searchInScope(*CI);
+        Ann->setNewDc(std::move(Curr));
+        continue;
+      }
+
 
       if (Curr->Chain.front().isRet())
         Ann->template makeIntactDep<-1, -1>();
@@ -2044,105 +2176,6 @@ void BUCtx<DT>::visitLoad(LoadInst &LI) {
 
   // Then check where the value comes from
   goThroughMem(LI);
-}
-
-template<>
-void BUCtx<DepType::CTRL>::searchInScope(Instruction &B) {
-
-  auto *Ann = (LKMMSearchPolicy::AnnotCtx<DepType::CTRL> *)this;
-  auto *Cond = cast<BranchInst>(Ann->getDc().Chain.front().Val);
-
-  LKMMSearchPolicy::AnnotCtx<DepType::DATA> DataAC(Ann->getKind(), Ann->AnnotateFn, Ann->PrevResult);
-  DataAC.populate(Ann->I, Ann->R, Ann->MD, Ann->D, Ann->RD, Ann->MDD, Ann->MR, Ann->MRR, Ann->MRMD);
-  DataAC.setF(Ann->F);
-
-  for (auto &BB: *(Cond->getFunction())) {
-
-    if (Cond == BB.getTerminator())
-      continue;
-
-    // bool IsAlwaysReachable = true;
-    // bool IsReachableOnce = false;
-    // for (auto *Succ: Cond->successors()) {
-    //   bool tmp = isPotentiallyReachable(Succ, &BB);
-    //   IsAlwaysReachable &= tmp;
-    //   IsReachableOnce |= tmp; // false positives!
-    // }
-
-    // if (!IsReachableOnce)
-    //   continue;
-    if (!isPotentiallyReachable(Cond->getParent(), &BB))
-      continue;
-
-    if (Ann->getPDT().dominates(&BB, Cond->getParent()))
-      continue;
-
-    for (auto &I : BB) {
-      if (isLKMMStore(&I)) {
-        auto Curr = Ann->getDCPtr();
-        auto Cpy = std::make_unique<DC<LKMMSearchPolicy>>(*Curr);
-
-        if (auto *_ = dyn_cast<ReturnInst>(&B)) {
-          DataAC.setNewDc(std::move(Cpy));
-          DataAC.getDc().addLink(&B, getLastNonEmptyLvl(Curr->Chain));
-          DataAC.getDc().insertLink(&I, DCLevel::PTE);
-          DataAC.makeIntactDep<1, 0>();
-
-          Ann->setNewDc(std::move(Curr));
-          continue;
-        }
-
-        Ann->setNewDc(std::move(Cpy));
-        Ann->getDc().addLink(&B, DCLevel::PTE);
-        Ann->getDc().insertLink(&I, DCLevel::PTE);
-
-        if (isLKMMLoad(&B))
-          Ann->makeIntactDep<0, 0>();
-        else if (isa<CallInst>(&B))
-          Ann->makeIntactDep<-1, 0>();
-        else
-          llvm_unreachable("Unexpected instruction heading ctrl dependency chain");
-
-        Ann->setNewDc(std::move(Curr));
-      }
-      if (auto *CI = dyn_cast<CallInst>(&I)) {
-
-        auto *Callee = CI->getCalledFunction();
-        if (!Callee)
-          continue;
-
-        auto Curr = Ann->getDCPtr();
-        auto Cpy = std::make_unique<DC<LKMMSearchPolicy>>(*Curr);
-
-        if (auto *_ = dyn_cast<ReturnInst>(&B)) {
-          Callee->addFnAttr(takes<DepType::DATA>());
-
-          DataAC.setNewDc(std::move(Cpy));
-          DataAC.getDc().addLink(&B, getLastNonEmptyLvl(Curr->Chain));
-          DataAC.getDc().insertLink(CI, DCLevel::PTE, -1);
-          DataAC.makeIntactDep<1, 1>();
-
-          Ann->setNewDc(std::move(Curr));
-          continue;
-        }
-
-        Ann->setNewDc(std::move(Cpy));
-        Ann->getDc().addLink(&B, DCLevel::PTE);
-        Ann->getDc().insertLink(CI, DCLevel::BOTH, -1);
-
-        if (auto *_ = dyn_cast<LoadInst>(&B))
-          Ann->makeIntactDep<0, 1>();
-        else if (auto *_ = dyn_cast<CallInst>(&B))
-          Ann->makeIntactDep<-1, 1>();
-        else
-          llvm_unreachable("Unexpected instruction heading ctrl dependency chain");
-
-        Ann->setNewDc(std::move(Curr));
-      }
-    }
-  }
-
-  return;
 }
 
 template <>

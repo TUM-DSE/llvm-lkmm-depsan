@@ -417,7 +417,7 @@ class LKMMAnnotateDeps {
 
 public:
   using DC = DC<LKMMAnnotateDeps>;
-  using DepMap = std::vector<SegmentID<0,0, LKMMAnnotateDeps>>;
+  using DepMap = std::map<size_t, SegmentID<0,0, LKMMAnnotateDeps>>;
 
   enum DCLinkType { VALUE, CALL, RETURN, CONTROL };
   class DCLink;
@@ -745,6 +745,21 @@ private:
   LKMMSearchPolicy Policy;
   void verifyChain(LKMMAnnotateDeps::DepMap *Pre, LKMMAnnotateDeps::DepMap *Post, Module &M);
   static void addChain(const SegmentID<0,0, LKMMSearchPolicy> &Seg, const DepType DT, LKMMAnnotateDeps::DepMap *Result);
+};
+
+//===----------------------------------------------------------------------===//
+// MemIntrinsic Removal Pass
+//===----------------------------------------------------------------------===//
+class LKMMRemoveIntrinsics : public PassInfoMixin<LKMMRemoveIntrinsics> {
+public:
+  PreservedAnalyses run(Module &M, ModuleAnalysisManager &AM);
+
+private:
+  void buildMemcpy(Module &M);
+  void buildMemmove(Module &M);
+  void buildMemset(Module &M);
+  Function *buildMemcpyFast(Module &M, size_t Width);
+  Function *buildMemsetFast(Module &M, size_t Width);
 };
 
 } // namespace llvm

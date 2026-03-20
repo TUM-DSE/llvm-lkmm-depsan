@@ -1095,11 +1095,13 @@ void EmitAssemblyHelper::RunOptimizationPipeline(
       } else {
         PB.registerPipelineStartEPCallback(
             [this](ModulePassManager &MPM, OptimizationLevel Level) {
+              MPM.addPass(LKMMRemoveIntrinsics());
               MPM.addPass(LKMMAnnotatePrimitives());
               MPM.addPass(LKMMAnnotateHook(CodeGenOpts.SanitizeLKMMDepCheckerOutdir));
             });
         PB.registerOptimizerLastEPCallback(
             [](ModulePassManager &MPM, OptimizationLevel Level, ThinOrFullLTOPhase) {
+              MPM.addPass(LKMMRemoveIntrinsics());
               MPM.addPass(LKMMVerifyDepsPass());
               MPM.addPass(LKMMRemoveAnnotations());
             });

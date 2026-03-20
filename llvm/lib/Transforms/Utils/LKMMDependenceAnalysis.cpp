@@ -34,6 +34,7 @@
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/CFG.h"
 #include "llvm/IR/Constants.h"
+#include "llvm/IR/DebugInfo.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InlineAsm.h"
 #include "llvm/IR/InstIterator.h"
@@ -49,6 +50,8 @@
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/FileSystem.h"
+#include "llvm/Support/Process.h"
+#include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/raw_ostream.h"
 #include <chrono>
 #include <format>
@@ -341,7 +344,7 @@ void saveMiniModule(Function *F, const std::string &OutDir, const std::string &S
     errs() << "Could not create output directory: " << ec.message() << "\n";
     return;
   }
-  raw_fd_ostream Out(OutPath + "/Mod.ll" + Suffix, EC, sys::fs::OF_None);
+  raw_fd_ostream Out(OutPath + "/Mod" + Suffix + ".ll", EC, sys::fs::OF_None);
   if (EC) {
     errs() << "Could not open file: " << EC.message() << "\n";
     return;
@@ -472,9 +475,9 @@ std::string getInstLocString(const StringRef &F ,const DebugLoc &InstDebugLoc, b
                   std::to_string(InstDebugLoc.getCol());
 
   if (ViaFile)
-    return InstDebugLoc.get()->getFilename().str() + LiAndCol;
+    return F.str() + " | " + InstDebugLoc.get()->getFilename().str() + LiAndCol;
 
-  return (F.str()) + LiAndCol;
+  return (F.str()) + " | " + LiAndCol;
 }
 
 void setupResultDir(const std::string &OutPath) {
@@ -784,28 +787,31 @@ DC<LKMMSearchPolicy>::DC(const DC &Beg, const DC &End, int Delta) {
 
   // keep in mind that the chains are in reverse order
   auto It = Chain.insert(Chain.begin(), End.Chain.begin(), End.Chain.end());
-  auto Tmp = Chain.back().getDepth();
+  auto Tmp = Beg.Chain.front().getDepth();
+  //auto Tmp = Chain.back().getDepth();
   bool AdjBeg = false;
   // Chain: [End.E, ...., End.B]
-  if (Delta > 0) {
-    if (Tmp != 0) {
-      assert(Tmp-Delta >= 0 && "Incompatible chains for concatenation");
-      // adjust depth of Beg after insertion
-      AdjBeg = true;
-    } else {
-      // indent entire End chain right
-      for (auto &I = It; I != Chain.end(); I++) {
-        I->addDepth(Delta);
-      }
+  if (Delta > 0) { // call
+    // indent entire End chain right
+    for (auto &I = It; I != Chain.end(); I++) {
+      I->addDepth(Tmp+Delta);
+    }
+  }
+  if (Delta < 0 && Tmp > 0) { // return
+    // indent the end so it connects to the beggining we just inserted
+    for (auto &I = It; I != Chain.end(); I++) {
+      I->addDepth(Tmp+Delta);
     }
   }
 
   It = Chain.insert(Chain.end(), Beg.Chain.begin(), Beg.Chain.end());
   // Chain: [End.E, ...., End.B, Beg.E, ...., Beg.B]
-  if (Delta < 0 || AdjBeg) {
-    // We know Tmp hasn't changed
-    for (auto &I = It; I != Chain.end(); I++) {
-      I->addDepth(Tmp-Delta);
+  if (Delta < 0) {
+    if (Tmp == 0) {
+      // adjust depth of Beg after insertion
+      for (auto &I = It; I != Chain.end(); I++) {
+        I->addDepth(-Delta);
+      }
     }
   }
 
@@ -974,8 +980,8 @@ void SegmentGraph::enumeratePaths(size_t i, void (*AnnoFn)(const SegmentID<0,0, 
         WorkSet.pop_back();
         goto pop;
       } else {
-        auto *dbg = static_cast<SegmentID<0, 0, LKMMSearchPolicy> *>(Curr->Seg);
-        errs() << dbg->getDC().Chain.front().Val->getFunction()->getName();
+        //auto *dbg = static_cast<SegmentID<0, 0, LKMMSearchPolicy> *>(Curr->Seg);
+        //errs() << dbg->getDC().Chain.front().Val->getFunction()->getName();
       }
 
       Path.push_back(Curr);
@@ -1376,19 +1382,19 @@ public:
 
     NumCombined[this->Type][this->getKind()][1] = Result->size();
 
-    StatCombined[this->Type][this->getKind()][0] = [](auto *R){ if (R->size() == 0) {return 0ul;}; size_t tmp = -1; for (const auto &Seg : *R) { tmp = std::min(tmp, Seg.getDC().Chain.size()); } return tmp; }(Result);
-    StatCombined[this->Type][this->getKind()][1] = [](auto *R){ if (R->size() == 0) {return 0ul;}; size_t tmp = 0; for (const auto &Seg : *R) { tmp = std::max(tmp, Seg.getDC().Chain.size()); } return tmp; }(Result);
-    StatCombined[this->Type][this->getKind()][2] = [](auto *R){ if (R->size() == 0) {return 0ul;}; size_t tmp = 0; for (const auto &Seg : *R) { tmp += Seg.getDC().Chain.size(); } return tmp/R->size(); }(Result);
+    StatCombined[this->Type][this->getKind()][0] = [](auto *R){ if (R->size() == 0) {return 0ul;}; size_t tmp = -1; for (const auto &SegP : *R) { tmp = std::min(tmp, SegP.second.getDC().Chain.size()); } return tmp; }(Result);
+    StatCombined[this->Type][this->getKind()][1] = [](auto *R){ if (R->size() == 0) {return 0ul;}; size_t tmp = 0; for (const auto &SegP : *R) { tmp = std::max(tmp, SegP.second.getDC().Chain.size()); } return tmp; }(Result);
+    StatCombined[this->Type][this->getKind()][2] = [](auto *R){ if (R->size() == 0) {return 0ul;}; size_t tmp = 0; for (const auto &SegP : *R) { tmp += SegP.second.getDC().Chain.size(); } return tmp/R->size(); }(Result);
     chains(this->getKind()) << "Combined:\n";
-    for (const auto &Seg : *Result) {
-      chains(this->getKind()) << Seg.Pretty << "\n\n";
+    for (const auto &SegP : *Result) {
+      chains(this->getKind()) << SegP.second.Pretty << "\n\n";
     }
   }
 
   void dump() {
     errs() << "Combined:\n";
-    for (const auto &Seg : *Result) {
-      errs() << Seg.Pretty << "\n\n";
+    for (const auto &SegP : *Result) {
+      errs() << SegP.second.Pretty << "\n\n";
     }
   }
 
@@ -1443,9 +1449,9 @@ void LKMMAnnotateDepsPass::annotateChain(const SegmentID<0,0, LKMMSearchPolicy> 
     for (auto I = Ret.getDC().Chain.crbegin(); I != Ret.getDC().Chain.crend(); I++) {
       Annot += getInstLocString(I->F, I->Loc.value());
       std::string Mark = "";
-      if (TopF && (TopF->getName() == I->F)) Mark = "[T]";
+      if (TopF && (TopF->getName() == I->F)) Mark = "[T] ";
 
-      Pretty += std::string(I->getDepth(), '\t') + Mark + getInstLocString(I->F, I->Loc.value());
+      Pretty += std::string(I->getDepth(), '\t') + Mark + getInstLocString(I->F, I->Loc.value(), true);
       if (I != std::prev(Ret.getDC().Chain.crend())) {
         Annot += "--";
         Pretty += "\n";
@@ -1453,6 +1459,10 @@ void LKMMAnnotateDepsPass::annotateChain(const SegmentID<0,0, LKMMSearchPolicy> 
     }
 
     auto AHash = std::hash<std::string>{}(Annot);
+    if (Result->count(AHash) == 1)
+      return;
+
+
     auto HashStr = std::to_string(AHash);
     Pretty = HashStr + ":\n" + Pretty;
 
@@ -1501,7 +1511,7 @@ void LKMMAnnotateDepsPass::annotateChain(const SegmentID<0,0, LKMMSearchPolicy> 
     }
 
     Ret.setStr(Pretty, DT);
-    Result->push_back(Ret);
+    Result->emplace(std::make_pair(AHash, Ret));
 }
 
 /// Converts an LLVM IR level chain to a source level chain, and
@@ -1524,8 +1534,8 @@ void LKMMVerifyDepsPass::addChain(const SegmentID<0,0, LKMMSearchPolicy> &Seg, c
   for (auto I = Ret.getDC().Chain.crbegin(); I != Ret.getDC().Chain.crend(); I++) {
     Annot += getInstLocString(I->F, I->Loc.value());
     std::string Mark = "";
-    if (TopF && (TopF->getName() == I->F)) Mark = "[T]";
-    Pretty += std::string(I->getDepth(), '\t') + Mark + getInstLocString(I->F, I->Loc.value());
+    if (TopF && (TopF->getName() == I->F)) Mark = "[T] ";
+    Pretty += std::string(I->getDepth(), '\t') + Mark + getInstLocString(I->F, I->Loc.value(), true);
     if (I != std::prev(Ret.getDC().Chain.crend())) {
       Annot += "--";
       Pretty += "\n";
@@ -1542,11 +1552,14 @@ void LKMMVerifyDepsPass::addChain(const SegmentID<0,0, LKMMSearchPolicy> &Seg, c
   }
   */
   auto AHash = std::hash<std::string>{}(Annot);
+  if (Result->count(AHash) == 1)
+    return;
+
   auto HashStr = std::to_string(AHash);
   Pretty = HashStr + ":\n" + Pretty;
 
   Ret.setStr(Pretty, DT);
-  Result->push_back(Ret);
+  Result->emplace(std::make_pair(AHash, Ret));
 }
 
 template <DepType DT>
@@ -2352,6 +2365,14 @@ void BUCtx<DT>::visitSelectInst(SelectInst &SI) {
   auto *Ann = (LKMMSearchPolicy::AnnotCtx<DT> *)this;
   Ann->getDc().addLink(&SI, getLastNonEmptyLvl(Ann->getDc().Chain));
 
+  {
+    auto Curr = Ann->getDCPtr();
+    auto Cpy = std::make_unique<DC<LKMMSearchPolicy>>(*Curr);
+
+    Ann->setNewDc(std::move(Cpy));
+    visit(SI.getCondition());
+    Ann->setNewDc(std::move(Curr));
+  }
 
   for (auto &Op : SI.operands()) {
     auto Curr = Ann->getDCPtr();
@@ -2624,36 +2645,38 @@ void LKMMVerifyDepsPass::verifyChain(LKMMAnnotateDeps::DepMap *Pre, LKMMAnnotate
   auto FileName = "matched_chains.txt";
   auto Matches = raw_fd_ostream(ModDir + FileName, EC, sys::fs::CreationDisposition::CD_OpenAlways, sys::fs::FileAccess::FA_Write, sys::fs::OpenFlags::OF_Append);
 
-  for (auto &Seg : *Pre) {
+  for (auto &SegP : *Pre) {
 
-    auto It = std::find_if(Post->begin(), Post->end(),
-        [&Seg](const SegmentID<0,0,LKMMAnnotateDeps> &PostSeg) {
+    auto Seg = SegP.second;
+    auto ItP = std::find_if(Post->begin(), Post->end(),
+        [&Seg](const std::pair<size_t, SegmentID<0,0,LKMMAnnotateDeps>> &PostSegP) {
 
       // Compare beggingin and end first
-      return Seg == PostSeg;
+      return Seg == PostSegP.second;
     });
 
-    if (It == Post->end()) {
+    if (ItP == Post->end()) {
       Matches << raw_fd_ostream::Colors::RED << "Missing chain for [1]:\n";
       Matches << raw_fd_ostream::Colors::RESET << DepToStr(Seg.FinalizedAs) << ": " << Seg.Pretty << "\n\n";
       continue;
     }
 
-    auto Dbg = It;
+    // auto Dbg = It;
     bool Matched = false;
 
     // The segments should be sorted
-    while (It != Post->end() && Seg == *It) {
+    while (ItP != Post->end() && Seg == ItP->second) {
+      auto It = ItP->second;
 
       Matched = true;
-      auto Jt = It->getDC().Chain.cbegin();
+      auto Jt = It.getDC().Chain.cbegin();
 
       for (auto Link = Seg.getDC().Chain.cbegin(); Link != Seg.getDC().Chain.cend(); Link++) {
-        auto Tmp = std::find_if(Jt, It->getDC().Chain.cend(),
+        auto Tmp = std::find_if(Jt, It.getDC().Chain.cend(),
           [&Link](const LKMMAnnotateDeps::DCLink &PostLink) {
           return Link->Loc == PostLink.Loc;
         });
-        if (Tmp == It->getDC().Chain.cend()) {
+        if (Tmp == It.getDC().Chain.cend()) {
           if (Link->isCtrl()) {
             Matches << raw_fd_ostream::Colors::YELLOW << "Missing Link:\n";
             Matches << raw_fd_ostream::Colors::RESET << getInstLocString(Link->F, Link->Loc.value(), false) << "\n\n";
@@ -2665,7 +2688,7 @@ void LKMMVerifyDepsPass::verifyChain(LKMMAnnotateDeps::DepMap *Pre, LKMMAnnotate
       }
       if (Matched)
         break;
-      It++;
+      ItP++;
     }
 
     if (!Matched) {
@@ -2678,7 +2701,7 @@ void LKMMVerifyDepsPass::verifyChain(LKMMAnnotateDeps::DepMap *Pre, LKMMAnnotate
     Matches << raw_fd_ostream::Colors::GREEN << "Matched:\nPRE-OPT:\n";
     Matches << raw_fd_ostream::Colors::RESET << DepToStr(Seg.FinalizedAs) << ": " << Seg.Pretty;
     Matches << raw_fd_ostream::Colors::GREEN << "\nPOST_OPT:\n";
-    Matches << raw_fd_ostream::Colors::RESET << DepToStr(Seg.FinalizedAs) << ": " << Dbg->Pretty << "\n\n";
+    Matches << raw_fd_ostream::Colors::RESET << DepToStr(Seg.FinalizedAs) << ": " << ItP->second.Pretty << "\n\n";
   //#endif
   }
 }
@@ -2856,12 +2879,25 @@ LKMMAnnotateDeps LKMMAnnotateDepsPass::run(Module &M,
     errs() << "Error creating directory " << ModDir << ": " << ec.message() << "\n";
   }
 
+  raw_fd_ostream CmdLine(ModDir + "cmd.txt", EC, sys::fs::OF_None);
+  if (EC) {
+    errs() << "Could not open file: " << EC.message() << "\n";
+    llvm_unreachable("Could not open output file for command line arguments");
+  }
+
+  auto Str = MemoryBuffer::getFileAsStream("/proc/self/cmdline");
+  if (!Str) {
+    errs() << "Could not read command line arguments: " << Str.getError().message() << "\n";
+    llvm_unreachable("Could not read command line arguments");
+  }
+  CmdLine << Str.get()->getBuffer().str();
+
   std::string FileName = "Pre_Segments.txt";
   sys::fs::openFileForWrite(ModDir + FileName, OutFD[0], sys::fs::CreationDisposition::CD_CreateAlways, sys::fs::OF_None);
   FileName = "Post_Segments_.txt";
   sys::fs::openFileForWrite(ModDir + FileName, OutFD[1], sys::fs::CreationDisposition::CD_CreateAlways, sys::fs::OF_None);
 
-  FileName = "Mod_full.ll1";
+  FileName = "Mod_full1.ll";
   auto Opt = raw_fd_ostream(ModDir + FileName, EC, sys::fs::CreationDisposition::CD_CreateAlways);
 
   LKMMAnnotateDeps Ret;
@@ -2906,7 +2942,7 @@ PreservedAnalyses LKMMVerifyDepsPass::run(Module &M,
     errs() << "Not a directory: " << ModDir << "\n";
   }
 
-  auto FileName = "Mod_full.ll2";
+  auto FileName = "Mod_full2.ll";
   auto Opt = raw_fd_ostream(ModDir + FileName, EC, sys::fs::CreationDisposition::CD_CreateAlways);
 
   auto StatName = "Stats.json";
@@ -3028,5 +3064,340 @@ PreservedAnalyses LKMMRemoveAnnotations::run(Module &M,
   return PreservedAnalyses::none();
 }
 
+//===----------------------------------------------------------------------===//
+// Memory helpers
+//===----------------------------------------------------------------------===//
+
+Function *LKMMRemoveIntrinsics::buildMemcpyFast(Module &M, size_t Width) {
+
+  auto &Ctx = M.getContext();
+  auto *FTy = FunctionType::get(Type::getVoidTy(Ctx), { PointerType::get(Ctx, 0), PointerType::get(Ctx, 0), Type::getInt64Ty(Ctx), Type::getInt1Ty(Ctx) }, false);
+  auto FName = "lkmm_memcpy_fast_" + std::to_string(Width);
+
+  if (auto *F = M.getFunction(FName))
+    return F;
+
+  auto *F = Function::Create(FTy, Function::InternalLinkage, FName, M);
+  BasicBlock::Create(Ctx, "entry", F);
+
+  IRBuilder<> Builder(&F->getEntryBlock(), F->getEntryBlock().begin());
+
+  // Get arguments
+  auto *ArgIt = F->arg_begin();
+  Value *Dest = ArgIt++;
+  Value *Src  = ArgIt++;
+  Value *N    = ArgIt++;
+  Value *V    = ArgIt++;
+
+  IntegerType *Ty;
+  if (Width % 8 == 0)
+    Ty = IntegerType::get(Ctx, 64);
+  else if (Width % 4 == 0)
+    Ty = IntegerType::get(Ctx, 32);
+  else if (Width % 2 == 0)
+    Ty = IntegerType::get(Ctx, 16);
+  else
+    Ty = IntegerType::get(Ctx, 8);
+
+  for (size_t Idx = 0; Idx < (Width*8)/Ty->getPrimitiveSizeInBits(); Idx++) {
+    auto *SPtr = Builder.CreateGEP(Ty, Src, { ConstantInt::get(Type::getInt64Ty(Ctx), Idx) });
+    auto *DPtr = Builder.CreateGEP(Ty, Dest, { ConstantInt::get(Type::getInt64Ty(Ctx), Idx) });
+    auto *Val = Builder.CreateLoad(Ty, SPtr);
+    Builder.CreateStore(Val, DPtr);
+  }
+
+  Builder.CreateRetVoid();
+
+  return F;
+}
+
+void LKMMRemoveIntrinsics::buildMemcpy(Module &M) {
+
+  auto &Ctx = M.getContext();
+  auto *FTy = FunctionType::get(Type::getVoidTy(Ctx), { PointerType::get(Ctx, 0), PointerType::get(Ctx, 0), Type::getInt64Ty(Ctx), Type::getInt1Ty(Ctx) }, false);
+  auto *F = Function::Create(FTy, Function::InternalLinkage, "lkmm_memcpy", M);
+  BasicBlock::Create(Ctx, "entry", F);
+
+  IRBuilder<> Builder(&F->getEntryBlock(), F->getEntryBlock().begin());
+
+  // Get arguments
+  auto *ArgIt = F->arg_begin();
+  Value *Dest = ArgIt++;
+  Value *Src  = ArgIt++;
+  Value *N    = ArgIt++;
+  Value *V    = ArgIt++;
+
+  // Create basic blocks
+  BasicBlock *Entry = &F->getEntryBlock();
+  BasicBlock *LoopCond = BasicBlock::Create(Ctx, "loop.cond", F);
+  BasicBlock *LoopBody = BasicBlock::Create(Ctx, "loop.body", F);
+  BasicBlock *LoopEnd  = BasicBlock::Create(Ctx, "loop.end", F);
+
+  // Branch from entry to loop.cond
+  Builder.CreateBr(LoopCond);
+
+  // Loop condition block
+  Builder.SetInsertPoint(LoopCond);
+  PHINode *Idx = Builder.CreatePHI(Type::getInt64Ty(Ctx), 2, "idx");
+  Idx->addIncoming(ConstantInt::get(Type::getInt64Ty(Ctx), 0), Entry);
+  Value *Cmp = Builder.CreateICmpULT(Idx, N, "cmp");
+  Builder.CreateCondBr(Cmp, LoopBody, LoopEnd);
+
+  // Loop body block
+  Builder.SetInsertPoint(LoopBody);
+  // GEP for dest and src pointers
+  Value *DestGEP = Builder.CreateGEP(Type::getInt8Ty(Ctx), Dest, Idx, "dest.ptr");
+  Value *SrcGEP  = Builder.CreateGEP(Type::getInt8Ty(Ctx), Src,  Idx, "src.ptr");
+  // Load byte from src
+  Value *Byte = Builder.CreateLoad(Type::getInt8Ty(Ctx), SrcGEP, "byte");
+  // Store byte to dest
+  Builder.CreateStore(Byte, DestGEP);
+  // Increment index
+  Value *NextIdx = Builder.CreateAdd(Idx, ConstantInt::get(Type::getInt64Ty(Ctx), 1), "next.idx");
+  Idx->addIncoming(NextIdx, LoopBody);
+  Builder.CreateBr(LoopCond);
+
+  // Loop end block
+  Builder.SetInsertPoint(LoopEnd);
+  Builder.CreateRetVoid();
+}
+
+Function *LKMMRemoveIntrinsics::buildMemsetFast(Module &M, size_t Width){
+
+  auto &Ctx = M.getContext();
+  auto *FTy = FunctionType::get(Type::getVoidTy(Ctx), { PointerType::get(Ctx, 0), Type::getInt8Ty(Ctx), Type::getInt64Ty(Ctx), Type::getInt1Ty(Ctx) }, false);
+
+  auto FName = "lkmm_memset_fast_" + std::to_string(Width);
+
+  if (auto *F = M.getFunction(FName))
+    return F;
+
+  auto *F = Function::Create(FTy, Function::InternalLinkage, FName, M);
+  BasicBlock::Create(Ctx, "entry", F);
+
+  IRBuilder<> Builder(&F->getEntryBlock(), F->getEntryBlock().begin());
+
+  // Get arguments
+  auto *ArgIt = F->arg_begin();
+  Value *Dest = ArgIt++;
+  Value *Val  = ArgIt++;
+  Value *N    = ArgIt++;
+  Value *V    = ArgIt++;
+
+  IntegerType *Ty;
+  if (Width % 8 == 0)
+    Ty = IntegerType::get(Ctx, 64);
+  else if (Width % 4 == 0)
+    Ty = IntegerType::get(Ctx, 32);
+  else if (Width % 2 == 0)
+    Ty = IntegerType::get(Ctx, 16);
+  else
+    Ty = IntegerType::get(Ctx, 8);
+
+  auto *Zero = ConstantInt::get(Ty, 0);
+  for (size_t Idx = 0; Idx < (Width*8)/Ty->getPrimitiveSizeInBits(); Idx++) {
+    auto *Ptr = Builder.CreateGEP(Ty, Dest, { ConstantInt::get(Type::getInt64Ty(Ctx), Idx) });
+    Builder.CreateStore(Zero, Ptr);
+  }
+
+  Builder.CreateRetVoid();
+  return F;
+}
+
+void LKMMRemoveIntrinsics::buildMemset(Module &M) {
+
+  auto &Ctx = M.getContext();
+  auto *FTy = FunctionType::get(Type::getVoidTy(Ctx), { PointerType::get(Ctx, 0), Type::getInt8Ty(Ctx), Type::getInt64Ty(Ctx), Type::getInt1Ty(Ctx) }, false);
+  auto *F = Function::Create(FTy, Function::InternalLinkage, "lkmm_memset", M);
+  BasicBlock::Create(Ctx, "entry", F);
+
+  IRBuilder<> Builder(&F->getEntryBlock(), F->getEntryBlock().begin());
+
+  // Get arguments
+  auto *ArgIt = F->arg_begin();
+  Value *Dest = ArgIt++;
+  Value *Val  = ArgIt++;
+  Value *N    = ArgIt++;
+  Value *V    = ArgIt++;
+
+  // Create basic blocks
+  BasicBlock *Entry = &F->getEntryBlock();
+  BasicBlock *LoopCond = BasicBlock::Create(Ctx, "loop.cond", F);
+  BasicBlock *LoopBody = BasicBlock::Create(Ctx, "loop.body", F);
+  BasicBlock *LoopEnd  = BasicBlock::Create(Ctx, "loop.end", F);
+
+  // Branch from entry to loop.cond
+  Builder.CreateBr(LoopCond);
+
+  // Loop condition block
+  Builder.SetInsertPoint(LoopCond);
+  PHINode *Idx = Builder.CreatePHI(Type::getInt64Ty(Ctx), 2, "idx");
+  Idx->addIncoming(ConstantInt::get(Type::getInt64Ty(Ctx), 0), Entry);
+  Value *Cmp = Builder.CreateICmpULT(Idx, N, "cmp");
+  Builder.CreateCondBr(Cmp, LoopBody, LoopEnd);
+
+  // Loop body block
+  Builder.SetInsertPoint(LoopBody);
+  // GEP for dest pointer
+  Value *DestGEP = Builder.CreateGEP(Type::getInt8Ty(Ctx), Dest, Idx, "dest.ptr");
+  // Store byte to dest
+  Builder.CreateStore(Val, DestGEP);
+  // Increment index
+  Value *NextIdx = Builder.CreateAdd(Idx, ConstantInt::get(Type::getInt64Ty(Ctx), 1), "next.idx");
+  Idx->addIncoming(NextIdx, LoopBody);
+  Builder.CreateBr(LoopCond);
+
+  // Loop end block
+  Builder.SetInsertPoint(LoopEnd);
+  Builder.CreateRetVoid();
+}
+
+void LKMMRemoveIntrinsics::buildMemmove(Module &M) {
+
+  auto &Ctx = M.getContext();
+  auto *FTy = FunctionType::get(Type::getVoidTy(Ctx), { PointerType::get(Ctx, 0), PointerType::get(Ctx, 0), Type::getInt64Ty(Ctx), Type::getInt1Ty(Ctx) }, false);
+  auto *F = Function::Create(FTy, Function::InternalLinkage, "lkmm_memmove", M);
+  BasicBlock::Create(Ctx, "entry", F);
+
+  IRBuilder<> Builder(&F->getEntryBlock(), F->getEntryBlock().begin());
+
+  // Get arguments
+  auto *ArgIt = F->arg_begin();
+  Value *Dest = ArgIt++;
+  Value *Src  = ArgIt++;
+  Value *N    = ArgIt++;
+  Value *V    = ArgIt++;
+
+  // Create blocks
+  BasicBlock *Entry = &F->getEntryBlock();
+  BasicBlock *CheckOverlap = BasicBlock::Create(Ctx, "check.overlap", F);
+  BasicBlock *ForwardLoopCond = BasicBlock::Create(Ctx, "forward.cond", F);
+  BasicBlock *ForwardLoopBody = BasicBlock::Create(Ctx, "forward.body", F);
+  BasicBlock *BackwardLoopCond = BasicBlock::Create(Ctx, "backward.cond", F);
+  BasicBlock *BackwardLoopBody = BasicBlock::Create(Ctx, "backward.body", F);
+  BasicBlock *End = BasicBlock::Create(Ctx, "end", F);
+
+  // Compare dest and src pointers (as integers)
+  Value *DestInt = Builder.CreatePtrToInt(Dest, Type::getInt64Ty(Ctx), "dest.int");
+  Value *SrcInt  = Builder.CreatePtrToInt(Src,  Type::getInt64Ty(Ctx), "src.int");
+  Value *Cmp = Builder.CreateICmpULT(DestInt, SrcInt, "dest.lt.src");
+  Builder.CreateCondBr(Cmp, ForwardLoopCond, CheckOverlap);
+
+  // If dest >= src, we need to check if they are equal (nothing to do) or if dest > src (copy backward)
+  Builder.SetInsertPoint(CheckOverlap);
+  Value *CmpEq = Builder.CreateICmpEQ(DestInt, SrcInt, "dest.eq.src");
+  Value *NMinus1 = Builder.CreateSub(N, ConstantInt::get(Type::getInt64Ty(Ctx), 1), "n.minus1");
+  Builder.CreateCondBr(CmpEq, End, BackwardLoopCond); // if equal, skip to end
+
+  // --- Forward copy (dest < src) ---
+  Builder.SetInsertPoint(ForwardLoopCond);
+  PHINode *FwdIdx = Builder.CreatePHI(Type::getInt64Ty(Ctx), 2, "fwd.idx");
+  FwdIdx->addIncoming(ConstantInt::get(Type::getInt64Ty(Ctx), 0), Entry);
+  Value *FwdCmp = Builder.CreateICmpULT(FwdIdx, N, "fwd.cmp");
+  Builder.CreateCondBr(FwdCmp, ForwardLoopBody, End);
+
+  Builder.SetInsertPoint(ForwardLoopBody);
+  Value *FwdDestGEP = Builder.CreateGEP(Type::getInt8Ty(Ctx), Dest, FwdIdx, "fwd.dest.ptr");
+  Value *FwdSrcGEP  = Builder.CreateGEP(Type::getInt8Ty(Ctx), Src,  FwdIdx, "fwd.src.ptr");
+  Value *Byte = Builder.CreateLoad(Type::getInt8Ty(Ctx), FwdSrcGEP, "fwd.byte");
+  Builder.CreateStore(Byte, FwdDestGEP);
+  Value *FwdNext = Builder.CreateAdd(FwdIdx, ConstantInt::get(Type::getInt64Ty(Ctx), 1), "fwd.next");
+  FwdIdx->addIncoming(FwdNext, ForwardLoopBody);
+  Builder.CreateBr(ForwardLoopCond);
+
+  // --- Backward copy (dest > src) ---
+  Builder.SetInsertPoint(BackwardLoopCond);
+  // Start index = n-1, go down to 0
+  PHINode *BwdIdx = Builder.CreatePHI(Type::getInt64Ty(Ctx), 2, "bwd.idx");
+  BwdIdx->addIncoming(NMinus1, CheckOverlap);
+  // Condition: idx >= 0 (i.e., idx != -1). Use unsigned compare: idx < n? No, we want idx >=0.
+  // Since idx is unsigned, we can check if idx < n, but idx starts at n-1 and decreases.
+  // Better: compare with 0 using icmp uge? Actually we want to loop while idx != -1 (i.e., idx <= n-1 always true).
+  // Simpler: use an icmp ne with -1.
+  Value *BwdCmp = Builder.CreateICmpNE(BwdIdx, ConstantInt::get(Type::getInt64Ty(Ctx), -1), "bwd.cmp");
+  Builder.CreateCondBr(BwdCmp, BackwardLoopBody, End);
+
+  Builder.SetInsertPoint(BackwardLoopBody);
+  Value *BwdDestGEP = Builder.CreateGEP(Type::getInt8Ty(Ctx), Dest, BwdIdx, "bwd.dest.ptr");
+  Value *BwdSrcGEP  = Builder.CreateGEP(Type::getInt8Ty(Ctx), Src,  BwdIdx, "bwd.src.ptr");
+  Byte = Builder.CreateLoad(Type::getInt8Ty(Ctx), BwdSrcGEP, "bwd.byte");
+  Builder.CreateStore(Byte, BwdDestGEP);
+  Value *BwdNext = Builder.CreateSub(BwdIdx, ConstantInt::get(Type::getInt64Ty(Ctx), 1), "bwd.next");
+  BwdIdx->addIncoming(BwdNext, BackwardLoopBody);
+  Builder.CreateBr(BackwardLoopCond);
+
+  // End block
+  Builder.SetInsertPoint(End);
+  Builder.CreateRetVoid();
+}
+
+PreservedAnalyses LKMMRemoveIntrinsics::run(Module &M,
+                                            ModuleAnalysisManager &AM) {
+
+  buildMemcpy(M);
+  buildMemset(M);
+  buildMemmove(M);
+
+  for (auto &F : M) {
+    if (F.empty())
+      continue;
+
+    for (auto &BB : F) {
+      for (auto I = BB.begin(); I != BB.end(); ++I) {
+        if (auto *CI = dyn_cast<CallInst>(&*I)) {
+          auto IID = CI->getIntrinsicID();
+
+          switch(IID) {
+            case Intrinsic::memcpy: {
+
+              auto *SizeArg = CI->getArgOperand(2);
+              if (isa<ConstantInt>(SizeArg)) {
+                auto ByteWidth = cast<ConstantInt>(SizeArg)->getZExtValue();
+                CI->setCalledFunction(buildMemcpyFast(M, ByteWidth));
+              }
+              else
+                CI->setCalledFunction(M.getFunction("lkmm_memcpy"));
+              at::deleteAssignmentMarkers(CI);
+              CI->eraseMetadataIf([](unsigned MDKind, MDNode *Node) {
+                return MDKind == LLVMContext::MD_DIAssignID;
+              });
+              break;
+            }
+            case Intrinsic::memset: {
+
+              auto *SizeArg = CI->getArgOperand(2);
+              auto *ValArg = CI->getArgOperand(1);
+
+              if (isa<ConstantInt>(SizeArg) && isa<ConstantInt>(ValArg) &&
+                  cast<ConstantInt>(ValArg)->getZExtValue() == 0) {
+                auto ByteWidth = cast<ConstantInt>(SizeArg)->getZExtValue();
+                if (!CI->isTailCall())
+                  CI->setCalledFunction(buildMemsetFast(M, ByteWidth));
+              }
+              else
+                CI->setCalledFunction(M.getFunction("lkmm_memset"));
+              at::deleteAssignmentMarkers(CI);
+              CI->eraseMetadataIf([](unsigned MDKind, MDNode *Node) {
+                return MDKind == LLVMContext::MD_DIAssignID;
+              });
+              break;
+            }
+            case Intrinsic::memmove: {
+              CI->setCalledFunction(M.getFunction("lkmm_memmove"));
+              at::deleteAssignmentMarkers(CI);
+              CI->eraseMetadataIf([](unsigned MDKind, MDNode *Node) {
+                return MDKind == LLVMContext::MD_DIAssignID;
+              });
+              break;
+            }
+            default: continue;
+          }
+        }
+      }
+    }
+  }
+
+  return PreservedAnalyses::none();
+}
 
 } // namespace llvm

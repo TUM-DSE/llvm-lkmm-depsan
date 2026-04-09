@@ -309,6 +309,9 @@ public:
       auto LBegin = LBeginOpt.value();
       auto RBegin = RBeginOpt.value();
 
+      if (!LBegin || !RBegin)
+        return false;
+
       if (LBegin.getLine() != RBegin.getLine())
         return LBegin.getLine() < RBegin.getLine();
 

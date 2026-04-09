@@ -2970,16 +2970,20 @@ PreservedAnalyses LKMMVerifyDepsPass::run(Module &M,
 // The Annotation Transformation
 //===----------------------------------------------------------------------===//
 
-static void annotateAllRec(Function &F, const StringRef &Annot) {
+static void annotateAllRec(Function &F, const StringRef &Annot, std::set<Function *> &visited) {
+  visited.insert(&F);
   for (auto &BB : F) {
     for (auto &I : BB) {
       MDNode *Meta = MDNode::get(I.getContext(), MDString::get(I.getContext(), Annot));
       I.setMetadata(LLVMContext::MD_lkmm_primitive, Meta);
       if (auto *CI = dyn_cast<CallInst>(&I)) {
-        if (!CI->getCalledFunction())
+        auto *next = CI->getCalledFunction();
+        if (!next)
+          continue;
+        if (std::find(visited.begin(), visited.end(), next) != visited.end())
           continue;
 
-        annotateAllRec(*CI->getCalledFunction(), Annot);
+        annotateAllRec(*next, Annot, visited);
       }
     }
   }
@@ -2995,7 +2999,8 @@ PreservedAnalyses LKMMAnnotatePrimitives::run(Module &M,
 
     const StringRef *Annot = nullptr;
     if (getAtomicAnnot(F.getName(), &Annot)) {
-      annotateAllRec(F, *Annot);
+      std::set<Function *> v;
+      annotateAllRec(F, *Annot, v);
       for (auto *U : F.users()) {
         if (auto *CI = dyn_cast<CallInst>(U)) {
           MDNode *Meta = MDNode::get(CI->getContext(), MDString::get(CI->getContext(), *Annot));
@@ -3071,7 +3076,7 @@ PreservedAnalyses LKMMRemoveAnnotations::run(Module &M,
 Function *LKMMRemoveIntrinsics::buildMemcpyFast(Module &M, size_t Width) {
 
   auto &Ctx = M.getContext();
-  auto *FTy = FunctionType::get(Type::getVoidTy(Ctx), { PointerType::get(Ctx, 0), PointerType::get(Ctx, 0), Type::getInt64Ty(Ctx), Type::getInt1Ty(Ctx) }, false);
+  auto *FTy = FunctionType::get(Type::getVoidTy(Ctx), { PointerType::get(Ctx, 0), PointerType::get(Ctx, 0) }, false);
   auto FName = "lkmm_memcpy_fast_" + std::to_string(Width);
 
   if (auto *F = M.getFunction(FName))
@@ -3086,8 +3091,6 @@ Function *LKMMRemoveIntrinsics::buildMemcpyFast(Module &M, size_t Width) {
   auto *ArgIt = F->arg_begin();
   Value *Dest = ArgIt++;
   Value *Src  = ArgIt++;
-  Value *N    = ArgIt++;
-  Value *V    = ArgIt++;
 
   IntegerType *Ty;
   if (Width % 8 == 0)
@@ -3114,7 +3117,7 @@ Function *LKMMRemoveIntrinsics::buildMemcpyFast(Module &M, size_t Width) {
 void LKMMRemoveIntrinsics::buildMemcpy(Module &M) {
 
   auto &Ctx = M.getContext();
-  auto *FTy = FunctionType::get(Type::getVoidTy(Ctx), { PointerType::get(Ctx, 0), PointerType::get(Ctx, 0), Type::getInt64Ty(Ctx), Type::getInt1Ty(Ctx) }, false);
+  auto *FTy = FunctionType::get(Type::getVoidTy(Ctx), { PointerType::get(Ctx, 0), PointerType::get(Ctx, 0), Type::getInt64Ty(Ctx) }, false);
   auto *F = Function::Create(FTy, Function::InternalLinkage, "lkmm_memcpy", M);
   BasicBlock::Create(Ctx, "entry", F);
 
@@ -3125,7 +3128,6 @@ void LKMMRemoveIntrinsics::buildMemcpy(Module &M) {
   Value *Dest = ArgIt++;
   Value *Src  = ArgIt++;
   Value *N    = ArgIt++;
-  Value *V    = ArgIt++;
 
   // Create basic blocks
   BasicBlock *Entry = &F->getEntryBlock();
@@ -3165,7 +3167,7 @@ void LKMMRemoveIntrinsics::buildMemcpy(Module &M) {
 Function *LKMMRemoveIntrinsics::buildMemsetFast(Module &M, size_t Width){
 
   auto &Ctx = M.getContext();
-  auto *FTy = FunctionType::get(Type::getVoidTy(Ctx), { PointerType::get(Ctx, 0), Type::getInt8Ty(Ctx), Type::getInt64Ty(Ctx), Type::getInt1Ty(Ctx) }, false);
+  auto *FTy = FunctionType::get(Type::getVoidTy(Ctx), { PointerType::get(Ctx, 0) }, false);
 
   auto FName = "lkmm_memset_fast_" + std::to_string(Width);
 
@@ -3180,9 +3182,6 @@ Function *LKMMRemoveIntrinsics::buildMemsetFast(Module &M, size_t Width){
   // Get arguments
   auto *ArgIt = F->arg_begin();
   Value *Dest = ArgIt++;
-  Value *Val  = ArgIt++;
-  Value *N    = ArgIt++;
-  Value *V    = ArgIt++;
 
   IntegerType *Ty;
   if (Width % 8 == 0)
@@ -3207,7 +3206,7 @@ Function *LKMMRemoveIntrinsics::buildMemsetFast(Module &M, size_t Width){
 void LKMMRemoveIntrinsics::buildMemset(Module &M) {
 
   auto &Ctx = M.getContext();
-  auto *FTy = FunctionType::get(Type::getVoidTy(Ctx), { PointerType::get(Ctx, 0), Type::getInt8Ty(Ctx), Type::getInt64Ty(Ctx), Type::getInt1Ty(Ctx) }, false);
+  auto *FTy = FunctionType::get(Type::getVoidTy(Ctx), { PointerType::get(Ctx, 0), Type::getInt8Ty(Ctx), Type::getInt64Ty(Ctx) }, false);
   auto *F = Function::Create(FTy, Function::InternalLinkage, "lkmm_memset", M);
   BasicBlock::Create(Ctx, "entry", F);
 
@@ -3218,7 +3217,6 @@ void LKMMRemoveIntrinsics::buildMemset(Module &M) {
   Value *Dest = ArgIt++;
   Value *Val  = ArgIt++;
   Value *N    = ArgIt++;
-  Value *V    = ArgIt++;
 
   // Create basic blocks
   BasicBlock *Entry = &F->getEntryBlock();
@@ -3255,7 +3253,7 @@ void LKMMRemoveIntrinsics::buildMemset(Module &M) {
 void LKMMRemoveIntrinsics::buildMemmove(Module &M) {
 
   auto &Ctx = M.getContext();
-  auto *FTy = FunctionType::get(Type::getVoidTy(Ctx), { PointerType::get(Ctx, 0), PointerType::get(Ctx, 0), Type::getInt64Ty(Ctx), Type::getInt1Ty(Ctx) }, false);
+  auto *FTy = FunctionType::get(Type::getVoidTy(Ctx), { PointerType::get(Ctx, 0), PointerType::get(Ctx, 0), Type::getInt64Ty(Ctx) }, false);
   auto *F = Function::Create(FTy, Function::InternalLinkage, "lkmm_memmove", M);
   BasicBlock::Create(Ctx, "entry", F);
 
@@ -3266,7 +3264,6 @@ void LKMMRemoveIntrinsics::buildMemmove(Module &M) {
   Value *Dest = ArgIt++;
   Value *Src  = ArgIt++;
   Value *N    = ArgIt++;
-  Value *V    = ArgIt++;
 
   // Create blocks
   BasicBlock *Entry = &F->getEntryBlock();
@@ -3343,6 +3340,7 @@ PreservedAnalyses LKMMRemoveIntrinsics::run(Module &M,
       continue;
 
     for (auto &BB : F) {
+      SmallVector<CallInst *, 16> ToBeRemoved;
       for (auto I = BB.begin(); I != BB.end(); ++I) {
         if (auto *CI = dyn_cast<CallInst>(&*I)) {
           auto IID = CI->getIntrinsicID();
@@ -3350,50 +3348,97 @@ PreservedAnalyses LKMMRemoveIntrinsics::run(Module &M,
           switch(IID) {
             case Intrinsic::memcpy: {
 
+              Function *NewF = nullptr;
+              SmallVector<Value *, 3> NewArgs;
               auto *SizeArg = CI->getArgOperand(2);
               if (isa<ConstantInt>(SizeArg)) {
                 auto ByteWidth = cast<ConstantInt>(SizeArg)->getZExtValue();
-                CI->setCalledFunction(buildMemcpyFast(M, ByteWidth));
+                NewF = buildMemcpyFast(M, ByteWidth);
               }
-              else
-                CI->setCalledFunction(M.getFunction("lkmm_memcpy"));
+              else {
+                NewF = M.getFunction("lkmm_memcpy");
+              }
+              for ( int i = 0; i < NewF->getFunctionType()->getNumParams(); i++ )
+                NewArgs.push_back(CI->getArgOperand(i));
+              auto *NC = CallInst::Create(NewF->getFunctionType(), NewF, NewArgs, "", CI);
               at::deleteAssignmentMarkers(CI);
               CI->eraseMetadataIf([](unsigned MDKind, MDNode *Node) {
                 return MDKind == LLVMContext::MD_DIAssignID;
               });
+              SmallVector<std::pair<unsigned, MDNode *>> Mds;
+              CI->getAllMetadata(Mds);
+              for (auto p : Mds) {
+                NC->setMetadata(p.first, p.second);
+              }
+              CI->replaceAllUsesWith(NC);
+              ToBeRemoved.push_back(CI);
               break;
             }
             case Intrinsic::memset: {
 
+              Function *NewF = nullptr;
+              SmallVector<Value *, 3> NewArgs;
               auto *SizeArg = CI->getArgOperand(2);
               auto *ValArg = CI->getArgOperand(1);
 
               if (isa<ConstantInt>(SizeArg) && isa<ConstantInt>(ValArg) &&
                   cast<ConstantInt>(ValArg)->getZExtValue() == 0) {
                 auto ByteWidth = cast<ConstantInt>(SizeArg)->getZExtValue();
-                if (!CI->isTailCall())
-                  CI->setCalledFunction(buildMemsetFast(M, ByteWidth));
+                NewF = buildMemsetFast(M, ByteWidth);
               }
-              else
-                CI->setCalledFunction(M.getFunction("lkmm_memset"));
+              else {
+                NewF = M.getFunction("lkmm_memset");
+              }
+              for ( int i = 0; i < NewF->getFunctionType()->getNumParams(); i++ ) {
+                int idx;
+                if (NewF->getFunctionType()->getParamType(i)->isPointerTy())
+                  idx = 0;
+                else if (NewF->getFunctionType()->getParamType(i)->getPrimitiveSizeInBits() == 8)
+                  idx = 1;
+                else
+                  idx = 2;
+                NewArgs.push_back(CI->getArgOperand(idx));
+              }
+              auto *NC = CallInst::Create(NewF->getFunctionType(), NewF, NewArgs, "", CI);
               at::deleteAssignmentMarkers(CI);
               CI->eraseMetadataIf([](unsigned MDKind, MDNode *Node) {
                 return MDKind == LLVMContext::MD_DIAssignID;
               });
+              SmallVector<std::pair<unsigned, MDNode *>> Mds;
+              CI->getAllMetadata(Mds);
+              for (auto p : Mds) {
+                NC->setMetadata(p.first, p.second);
+              }
+              CI->replaceAllUsesWith(NC);
+              ToBeRemoved.push_back(CI);
               break;
             }
             case Intrinsic::memmove: {
-              CI->setCalledFunction(M.getFunction("lkmm_memmove"));
+              Function *NewF = nullptr;
+              SmallVector<Value *, 3> NewArgs;
+              NewF = M.getFunction("lkmm_memmove");
+              for ( int i = 0; i < NewF->getFunctionType()->getNumParams(); i++ )
+                NewArgs.push_back(CI->getArgOperand(i));
+              auto *NC = CallInst::Create(NewF->getFunctionType(), NewF, NewArgs, "", CI);
               at::deleteAssignmentMarkers(CI);
               CI->eraseMetadataIf([](unsigned MDKind, MDNode *Node) {
                 return MDKind == LLVMContext::MD_DIAssignID;
               });
+              SmallVector<std::pair<unsigned, MDNode *>> Mds;
+              CI->getAllMetadata(Mds);
+              for (auto p : Mds) {
+                NC->setMetadata(p.first, p.second);
+              }
+              CI->replaceAllUsesWith(NC);
+              ToBeRemoved.push_back(CI);
               break;
             }
             default: continue;
           }
         }
       }
+      for (auto *CI : ToBeRemoved)
+        CI->eraseFromParent();
     }
   }
 

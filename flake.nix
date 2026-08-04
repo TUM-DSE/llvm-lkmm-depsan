@@ -29,6 +29,7 @@
           "-DCMAKE_BUILD_TYPE=Release"
           "-DLLVM_TARGETS_TO_BUILD=Native"
           "-DLLVM_PARALLEL_LINK_JOBS=4"
+          "-DLLVM_ENABLE_DUMP=ON"
         ];
 
         hardeningDisable = [ "all" ];

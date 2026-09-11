@@ -669,6 +669,14 @@ public:
     "__depsan_rcu_deref",
     "__depsan_rcu_assign",
     "__depsan_rcu_sync",
+    "__depsan_bpf_mb",
+    "__depsan_bpf_rmb",
+    "__depsan_bpf_wmb",
+    "__depsan_bpf_atomic",
+    "__depsan_bpf_ronce",
+    "__depsan_bpf_wonce",
+    "__depsan_bpf_l_acquire",
+    "__depsan_bpf_s_release",
   };
 
 private:

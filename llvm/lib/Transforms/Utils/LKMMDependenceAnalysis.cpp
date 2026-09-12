@@ -23,6 +23,7 @@
 #include "llvm/ADT/Hashing.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallSet.h"
+#include "llvm/ADT/StringSwitch.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Analysis/CFG.h"
 #include "llvm/Analysis/CallGraph.h"
@@ -2857,6 +2858,102 @@ isAsm:
       }
     }
   }
+}
+
+//===----------------------------------------------------------------------===//
+// Synthetic DILocation Stamping
+//===----------------------------------------------------------------------===//
+
+uint32_t LKMMSyntheticDILoc::primKindFromString(StringRef S) {
+  StringRef Suffix = S;
+  if (Suffix.consume_front("__depsan_bpf_"))
+    ;
+  else if (Suffix.consume_front("__depsan_"))
+    ;
+  else
+    return 0;
+
+  return StringSwitch<uint32_t>(Suffix)
+    .Case("ronce",      PRIM_RONCE)
+    .Case("wonce",      PRIM_WONCE)
+    .Case("mb",         PRIM_MB)
+    .Case("rmb",        PRIM_RMB)
+    .Case("wmb",        PRIM_WMB)
+    .Case("l_acquire",  PRIM_L_ACQUIRE)
+    .Case("s_release",  PRIM_S_RELEASE)
+    .Case("atomic",     PRIM_ATOMIC)
+    .Case("lock",       PRIM_LOCK)
+    .Case("unlock",     PRIM_UNLOCK)
+    .Case("rcu_deref",  PRIM_RCU_DEREF)
+    .Case("rcu_assign", PRIM_RCU_ASSIGN)
+    .Case("rcu_sync",   PRIM_RCU_SYNC)
+    .Case("barrier",    PRIM_BARRIER)
+    .Case("mb_ba",      PRIM_MB_BA)
+    .Case("mb_aa",      PRIM_MB_AA)
+    .Default(0);
+}
+
+StringRef LKMMSyntheticDILoc::primKindToString(uint32_t Kind) {
+  switch (Kind) {
+  case PRIM_RONCE:      return "ronce";
+  case PRIM_WONCE:      return "wonce";
+  case PRIM_MB:         return "mb";
+  case PRIM_RMB:        return "rmb";
+  case PRIM_WMB:        return "wmb";
+  case PRIM_L_ACQUIRE:  return "l_acquire";
+  case PRIM_S_RELEASE:  return "s_release";
+  case PRIM_ATOMIC:     return "atomic";
+  case PRIM_LOCK:       return "lock";
+  case PRIM_UNLOCK:     return "unlock";
+  case PRIM_RCU_DEREF:  return "rcu_deref";
+  case PRIM_RCU_ASSIGN: return "rcu_assign";
+  case PRIM_RCU_SYNC:   return "rcu_sync";
+  case PRIM_BARRIER:    return "barrier";
+  case PRIM_MB_BA:      return "mb_ba";
+  case PRIM_MB_AA:      return "mb_aa";
+  default:              return "unknown";
+  }
+}
+
+PreservedAnalyses LKMMSyntheticDILoc::run(Module &M,
+                                           ModuleAnalysisManager &AM) {
+  unsigned NextID = 1;
+  auto &Ctx = M.getContext();
+
+  for (auto &F : M) {
+    if (F.isDeclaration())
+      continue;
+
+    auto *SP = F.getSubprogram();
+    if (!SP)
+      continue;
+
+    for (auto &BB : F) {
+      for (auto &I : BB) {
+        auto *MD = I.getMetadata(LLVMContext::MD_lkmm_primitive);
+        if (!MD)
+          continue;
+
+        uint32_t PrimMask = 0;
+        for (unsigned J = 0, E = MD->getNumOperands(); J < E; ++J) {
+          if (auto *S = dyn_cast<MDString>(MD->getOperand(J)))
+            PrimMask |= primKindFromString(S->getString());
+        }
+
+        // Chain original location via InlinedAt
+        DILocation *OrigDL = I.getDebugLoc()
+            ? const_cast<DILocation *>(I.getDebugLoc().get())
+            : nullptr;
+        auto *NewDL = DILocation::get(Ctx, NextID, PrimMask, SP, OrigDL);
+        I.setDebugLoc(DebugLoc(NewDL));
+        NextID++;
+      }
+    }
+  }
+
+  errs() << "LKMMSyntheticDILoc: stamped " << (NextID - 1)
+         << " instructions\n";
+  return PreservedAnalyses::none();
 }
 
 //===----------------------------------------------------------------------===//

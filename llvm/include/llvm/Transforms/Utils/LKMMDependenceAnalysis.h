@@ -690,6 +690,39 @@ private:
 };
 
 //===----------------------------------------------------------------------===//
+// Synthetic DILocation Stamping
+//===----------------------------------------------------------------------===//
+
+class LKMMSyntheticDILoc : public PassInfoMixin<LKMMSyntheticDILoc> {
+public:
+  /// Primitive kind bitmask. An instruction may be inside multiple nested
+  /// primitives (e.g. smp_load_acquire wraps READ_ONCE), so we OR the bits.
+  enum PrimKind : uint32_t {
+    PRIM_RONCE      = 1 << 0,
+    PRIM_WONCE      = 1 << 1,
+    PRIM_MB         = 1 << 2,
+    PRIM_RMB        = 1 << 3,
+    PRIM_WMB        = 1 << 4,
+    PRIM_L_ACQUIRE  = 1 << 5,
+    PRIM_S_RELEASE  = 1 << 6,
+    PRIM_ATOMIC     = 1 << 7,
+    PRIM_LOCK       = 1 << 8,
+    PRIM_UNLOCK     = 1 << 9,
+    PRIM_RCU_DEREF  = 1 << 10,
+    PRIM_RCU_ASSIGN = 1 << 11,
+    PRIM_RCU_SYNC   = 1 << 12,
+    PRIM_BARRIER    = 1 << 13,
+    PRIM_MB_BA      = 1 << 14,
+    PRIM_MB_AA      = 1 << 15,
+  };
+
+  static uint32_t primKindFromString(StringRef S);
+  static StringRef primKindToString(uint32_t Kind);
+
+  PreservedAnalyses run(Module &M, ModuleAnalysisManager &AM);
+};
+
+//===----------------------------------------------------------------------===//
 // The Annotation Removal
 //===----------------------------------------------------------------------===//
 

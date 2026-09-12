@@ -1601,6 +1601,8 @@ SanitizerMask ToolChain::getSupportedSanitizers() const {
     Res |= SanitizerKind::ShadowCallStack;
   if (getTriple().isAArch64(64))
     Res |= SanitizerKind::MemTag;
+  // LKMMDepChecker is a pure IR analysis with no runtime — allow on all targets.
+  Res |= SanitizerKind::LKMMDepChecker;
   return Res;
 }
 

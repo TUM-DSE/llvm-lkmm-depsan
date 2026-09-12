@@ -1090,6 +1090,7 @@ void EmitAssemblyHelper::RunOptimizationPipeline(
         PB.registerPipelineStartEPCallback(
             [this](ModulePassManager &MPM, OptimizationLevel Level) {
               MPM.addPass(LKMMAnnotatePrimitives());
+              MPM.addPass(LKMMSyntheticDILoc());
               MPM.addPass(LKMMAnnotateHook(CodeGenOpts.SanitizeLKMMDepCheckerOutdir));
             });
       } else {
@@ -1097,11 +1098,12 @@ void EmitAssemblyHelper::RunOptimizationPipeline(
             [this](ModulePassManager &MPM, OptimizationLevel Level) {
               MPM.addPass(LKMMRemoveIntrinsics());
               MPM.addPass(LKMMAnnotatePrimitives());
+              MPM.addPass(LKMMSyntheticDILoc());
               MPM.addPass(LKMMAnnotateHook(CodeGenOpts.SanitizeLKMMDepCheckerOutdir));
             });
         PB.registerOptimizerLastEPCallback(
             [](ModulePassManager &MPM, OptimizationLevel Level, ThinOrFullLTOPhase) {
-              MPM.addPass(LKMMRemoveIntrinsics());
+              //MPM.addPass(LKMMRemoveIntrinsics());
               MPM.addPass(LKMMVerifyDepsPass());
               MPM.addPass(LKMMRemoveAnnotations());
             });

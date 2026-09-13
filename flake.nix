@@ -1,5 +1,5 @@
 {
-  description = "Custom clang";
+  description = "LLVM with LKMM dependency checker (clang, opt, llc)";
 
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs?ref=nixos-unstable";
@@ -12,7 +12,7 @@
     in
     {
       packages.default = pkgs.llvmPackages.stdenv.mkDerivation {
-        pname = "custom-clang";
+        pname = "llvm-lkmm-depsan";
         version = "0.1.0";
         src = self;
 
@@ -27,7 +27,7 @@
         cmakeFlags = [
           "-DLLVM_ENABLE_PROJECTS=clang"
           "-DCMAKE_BUILD_TYPE=Release"
-          "-DLLVM_TARGETS_TO_BUILD=Native"
+          "-DLLVM_TARGETS_TO_BUILD=Native;BPF"
           "-DLLVM_PARALLEL_LINK_JOBS=4"
           "-DLLVM_ENABLE_DUMP=ON"
         ];

@@ -2651,10 +2651,7 @@ void LKMMVerifyDepsPass::verifyChain(LKMMAnnotateDeps::DepMap *Pre, LKMMAnnotate
   Name = Name.substr(0, Name.length()-2);
 
   auto ModDir = Prefix + Name + "/";
-  auto e = sys::fs::is_directory(ModDir);
-  if (!e) {
-    errs() << "Not a directory [verify]: " << ModDir << "\n";
-  }
+  sys::fs::create_directories(ModDir);
 
   auto FileName = "matched_chains.txt";
   auto Matches = raw_fd_ostream(ModDir + FileName, EC, sys::fs::CreationDisposition::CD_OpenAlways, sys::fs::FileAccess::FA_Write, sys::fs::OpenFlags::OF_Append);
@@ -3176,10 +3173,7 @@ PreservedAnalyses LKMMVerifyDepsPass::run(Module &M,
   std::replace(Name.begin(), Name.end(), '/', '-');
   Name = Name.substr(0, Name.length()-2);
   auto ModDir = Prefix + Name + "/";
-  auto e = sys::fs::is_directory(ModDir);
-  if (!e) {
-    errs() << "Not a directory: " << ModDir << "\n";
-  }
+  sys::fs::create_directories(ModDir);
 
   auto FileName = "Mod_full2.ll";
   auto Opt = raw_fd_ostream(ModDir + FileName, EC, sys::fs::CreationDisposition::CD_CreateAlways);

@@ -54,12 +54,24 @@
 #include "llvm/Support/Process.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/IRReader/IRReader.h"
+#include "llvm/Support/SourceMgr.h"
 #include <chrono>
 #include <format>
 #include <variant>
 #include <iterator>
 
 #define DEBUG_TYPE "lkmm-dep-analyzer"
+
+static llvm::cl::opt<std::string>
+    PreoptIRPath("lkmm-preopt-ir",
+                 llvm::cl::desc("Path to pre-opt .ll for cross-verification"),
+                 llvm::cl::init(""));
+
+static llvm::cl::opt<std::string>
+    LKMMOutDir("lkmm-dep-checker-outdir",
+               llvm::cl::desc("Output directory for LKMM analysis results"),
+               llvm::cl::init(""));
 
 // This list is complete and will never change
 #define FOR_EACH_DEP(DO) \
@@ -2957,6 +2969,49 @@ PreservedAnalyses LKMMSyntheticDILoc::run(Module &M,
 }
 
 //===----------------------------------------------------------------------===//
+// Reattach Primitives from Synthetic DILocations
+//===----------------------------------------------------------------------===//
+
+PreservedAnalyses LKMMReattachPrimitives::run(Module &M,
+                                               ModuleAnalysisManager &AM) {
+  unsigned Count = 0;
+
+  for (auto &F : M) {
+    for (auto &BB : F) {
+      for (auto &I : BB) {
+        auto DL = I.getDebugLoc();
+        if (!DL)
+          continue;
+
+        unsigned Col = DL->getColumn();
+        if (Col == 0)
+          continue;
+
+        // Decode bitmask back to primitive name strings
+        SmallVector<Metadata *, 4> Ops;
+        for (unsigned Bit = 0; Bit < 16; ++Bit) {
+          if (Col & (1u << Bit)) {
+            auto Name = LKMMSyntheticDILoc::primKindToString(1u << Bit);
+            if (Name != "unknown")
+              Ops.push_back(MDString::get(M.getContext(), Name));
+          }
+        }
+
+        if (!Ops.empty()) {
+          I.setMetadata(LLVMContext::MD_lkmm_primitive,
+                        MDNode::get(M.getContext(), Ops));
+          Count++;
+        }
+      }
+    }
+  }
+
+  errs() << "LKMMReattachPrimitives: annotated " << Count
+         << " instructions\n";
+  return Count ? PreservedAnalyses::none() : PreservedAnalyses::all();
+}
+
+//===----------------------------------------------------------------------===//
 // The Annotation Pass
 //===----------------------------------------------------------------------===//
 
@@ -2964,6 +3019,32 @@ AnalysisKey LKMMAnnotateDepsPass::Key;
 
 LKMMAnnotateDeps LKMMAnnotateDepsPass::run(Module &M,
                                             ModuleAnalysisManager &AM) {
+  if (!LKMMOutDir.empty())
+    setupResultDir(LKMMOutDir);
+
+  // When -lkmm-preopt-ir is set, analyze that file instead of M.
+  // The verify pass will then compare those pre-opt chains against
+  // chains found in the current module (the lifted/post-opt IR).
+  if (!PreoptIRPath.empty()) {
+    SMDiagnostic Err;
+    auto PreoptMod = parseIRFile(PreoptIRPath, Err, M.getContext());
+    if (!PreoptMod) {
+      Err.print("lkmm-annotate-deps", errs());
+      report_fatal_error(Twine("Failed to load pre-opt IR from ") + PreoptIRPath);
+    }
+
+    errs() << "LKMMAnnotateDepsPass: analyzing external pre-opt IR from "
+           << PreoptIRPath << "\n";
+
+    LKMMAnnotateDeps Ret;
+    {
+      auto A = LKMMSearchPolicy::LKMMAnnotator(CK_Annot, &annotateChain);
+      Ret.add(DepType::ADDR, A.run<DepType::ADDR>(*PreoptMod, AM));
+      Ret.add(DepType::DATA, A.run<DepType::DATA>(*PreoptMod, AM));
+      Ret.add(DepType::CTRL, A.run<DepType::CTRL>(*PreoptMod, AM, true));
+    }
+    return Ret;
+  }
 
   auto EC = std::error_code();
   auto Name = M.getModuleIdentifier();

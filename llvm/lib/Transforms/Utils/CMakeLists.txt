@@ -102,7 +102,10 @@ add_llvm_component_library(LLVMTransformUtils
 
   LINK_COMPONENTS
   Analysis
+  AsmParser
+  BitReader
   Core
+  IRReader
   Support
   TargetParser
   )

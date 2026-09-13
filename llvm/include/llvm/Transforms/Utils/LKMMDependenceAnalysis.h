@@ -723,6 +723,18 @@ public:
 };
 
 //===----------------------------------------------------------------------===//
+// Reattach Primitives from Synthetic DILocations
+//===----------------------------------------------------------------------===//
+
+/// Inverse of LKMMSyntheticDILoc: reads the primitive bitmask from the column
+/// field of synthetic DILocations and attaches !lkmm.primitive metadata.
+/// Used on lifted IR where DILocations survived via BTF but metadata did not.
+class LKMMReattachPrimitives : public PassInfoMixin<LKMMReattachPrimitives> {
+public:
+  PreservedAnalyses run(Module &M, ModuleAnalysisManager &AM);
+};
+
+//===----------------------------------------------------------------------===//
 // The Annotation Removal
 //===----------------------------------------------------------------------===//
 

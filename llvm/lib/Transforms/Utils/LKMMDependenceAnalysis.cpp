@@ -35,6 +35,7 @@
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/CFG.h"
 #include "llvm/IR/Constants.h"
+#include "llvm/IR/DIBuilder.h"
 #include "llvm/IR/DebugInfo.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InlineAsm.h"
@@ -2878,12 +2879,10 @@ isAsm:
 
 uint32_t LKMMSyntheticDILoc::primKindFromString(StringRef S) {
   StringRef Suffix = S;
-  if (Suffix.consume_front("__depsan_bpf_"))
-    ;
-  else if (Suffix.consume_front("__depsan_"))
-    ;
-  else
-    return 0;
+  // Strip optional prefix — metadata strings may be bare names like "ronce"
+  // or prefixed like "__depsan_ronce" / "__depsan_bpf_ronce".
+  if (!Suffix.consume_front("__depsan_bpf_"))
+    Suffix.consume_front("__depsan_");
 
   return StringSwitch<uint32_t>(Suffix)
     .Case("ronce",      PRIM_RONCE)
@@ -2927,18 +2926,52 @@ StringRef LKMMSyntheticDILoc::primKindToString(uint32_t Kind) {
   }
 }
 
+static std::string decodeMask(uint32_t Mask) {
+  std::string Result;
+  for (unsigned Bit = 0; Bit < 16; ++Bit) {
+    uint32_t Kind = 1u << Bit;
+    if (!(Mask & Kind))
+      continue;
+    auto Name = LKMMSyntheticDILoc::primKindToString(Kind);
+    if (Name == "unknown")
+      continue;
+    if (!Result.empty())
+      Result += '|';
+    Result += Name;
+  }
+  return Result.empty() ? "unknown" : Result;
+}
+
 PreservedAnalyses LKMMSyntheticDILoc::run(Module &M,
                                            ModuleAnalysisManager &AM) {
   unsigned NextID = 1;
   auto &Ctx = M.getContext();
 
+  // Create a synthetic source file that maps IDs to annotation strings.
+  DIBuilder DB(M);
+  auto *SynthFile = DB.createFile("lkmm-synthetic.src", ".");
+  DB.createCompileUnit(dwarf::DW_LANG_C, SynthFile, "depsan", false, "", 0);
+  auto *SynthTy = DB.createSubroutineType(
+      DB.getOrCreateTypeArray(std::nullopt));
+
+  // One synthetic SP per function, all sharing the same file.
+  DenseMap<Function *, DISubprogram *> SynthSPs;
+
+  // Annotation lines: Lines[ID] = "ronce|l_acquire"
+  std::vector<std::string> Lines;
+  Lines.push_back(""); // ID 0 unused
+
   for (auto &F : M) {
     if (F.isDeclaration())
       continue;
 
-    auto *SP = F.getSubprogram();
-    if (!SP)
+    if (!F.getSubprogram())
       continue;
+
+    auto *SynthSP = DB.createFunction(
+        SynthFile, F.getName(), "", SynthFile, 0, SynthTy, 0,
+        DINode::FlagZero, DISubprogram::SPFlagDefinition);
+    SynthSPs[&F] = SynthSP;
 
     for (auto &BB : F) {
       for (auto &I : BB) {
@@ -2956,10 +2989,29 @@ PreservedAnalyses LKMMSyntheticDILoc::run(Module &M,
         DILocation *OrigDL = I.getDebugLoc()
             ? const_cast<DILocation *>(I.getDebugLoc().get())
             : nullptr;
-        auto *NewDL = DILocation::get(Ctx, NextID, PrimMask, SP, OrigDL);
+        auto *NewDL = DILocation::get(Ctx, NextID, PrimMask, SynthSP, OrigDL);
         I.setDebugLoc(DebugLoc(NewDL));
+        Lines.push_back(decodeMask(PrimMask));
         NextID++;
       }
+    }
+  }
+
+  DB.finalize();
+
+  // Write the synthetic source file to the output directory.
+  // Prefer LKMMOutDir (cl::opt for opt), fall back to Prefix (set by clang).
+  std::string OutDir = LKMMOutDir.empty() ? Prefix : LKMMOutDir;
+  if (!OutDir.empty()) {
+    if (OutDir.back() != '/')
+      OutDir += '/';
+    sys::fs::create_directories(OutDir);
+    std::error_code EC;
+    raw_fd_ostream Out(OutDir + "lkmm-synthetic.src", EC,
+                       sys::fs::OF_None);
+    if (!EC) {
+      for (unsigned I = 1; I < Lines.size(); ++I)
+        Out << I << ": " << Lines[I] << "\n";
     }
   }
 
@@ -2981,6 +3033,15 @@ PreservedAnalyses LKMMReattachPrimitives::run(Module &M,
       for (auto &I : BB) {
         auto DL = I.getDebugLoc();
         if (!DL)
+          continue;
+
+        // Only decode columns from synthetic DILocations (scope file is
+        // lkmm-synthetic.src), not from original source locations.
+        auto *Scope = DL->getScope();
+        if (!Scope)
+          continue;
+        auto *File = Scope->getFile();
+        if (!File || !File->getFilename().ends_with("lkmm-synthetic.src"))
           continue;
 
         unsigned Col = DL->getColumn();

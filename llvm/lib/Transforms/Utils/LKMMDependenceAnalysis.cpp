@@ -3080,75 +3080,166 @@ LKMMAnnotateDeps LKMMAnnotateDepsPass::run(Module &M,
   if (!LKMMOutDir.empty())
     setupResultDir(LKMMOutDir);
 
-  // When -lkmm-preopt-ir is set, analyze that file instead of M.
-  // The verify pass will then compare those pre-opt chains against
-  // chains found in the current module (the lifted/post-opt IR).
+  // Determine which module to analyze: external pre-opt IR or current module.
+  std::unique_ptr<Module> PreoptMod;
+  Module *AnalyzeMod = &M;
+
   if (!PreoptIRPath.empty()) {
     SMDiagnostic Err;
-    auto PreoptMod = parseIRFile(PreoptIRPath, Err, M.getContext());
+    PreoptMod = parseIRFile(PreoptIRPath, Err, M.getContext());
     if (!PreoptMod) {
       Err.print("lkmm-annotate-deps", errs());
       report_fatal_error(Twine("Failed to load pre-opt IR from ") + PreoptIRPath);
     }
-
+    AnalyzeMod = PreoptMod.get();
     errs() << "LKMMAnnotateDepsPass: analyzing external pre-opt IR from "
            << PreoptIRPath << "\n";
-
-    LKMMAnnotateDeps Ret;
-    {
-      auto A = LKMMSearchPolicy::LKMMAnnotator(CK_Annot, &annotateChain);
-      Ret.add(DepType::ADDR, A.run<DepType::ADDR>(*PreoptMod, AM));
-      Ret.add(DepType::DATA, A.run<DepType::DATA>(*PreoptMod, AM));
-      Ret.add(DepType::CTRL, A.run<DepType::CTRL>(*PreoptMod, AM, true));
-    }
-    return Ret;
   }
 
   auto EC = std::error_code();
-  auto Name = M.getModuleIdentifier();
+  auto Name = AnalyzeMod->getModuleIdentifier();
   std::replace(Name.begin(), Name.end(), '/', '-');
   Name = Name.substr(0, Name.length()-2);
 
   auto ModDir = Prefix + Name + "/";
-  auto ec = sys::fs::create_directories(ModDir);
-  if (ec) {
-    errs() << "Error creating directory " << ModDir << ": " << ec.message() << "\n";
+  sys::fs::create_directories(ModDir);
+
+  if (PreoptIRPath.empty()) {
+    // clang pipeline: save command line and segment files
+    raw_fd_ostream CmdLine(ModDir + "cmd.txt", EC, sys::fs::OF_None);
+    if (!EC) {
+      auto Str = MemoryBuffer::getFileAsStream("/proc/self/cmdline");
+      if (Str)
+        CmdLine << Str.get()->getBuffer().str();
+    }
+
+    std::string FileName = "Pre_Segments.txt";
+    sys::fs::openFileForWrite(ModDir + FileName, OutFD[0], sys::fs::CreationDisposition::CD_CreateAlways, sys::fs::OF_None);
+    FileName = "Post_Segments_.txt";
+    sys::fs::openFileForWrite(ModDir + FileName, OutFD[1], sys::fs::CreationDisposition::CD_CreateAlways, sys::fs::OF_None);
   }
 
-  raw_fd_ostream CmdLine(ModDir + "cmd.txt", EC, sys::fs::OF_None);
-  if (EC) {
-    errs() << "Could not open file: " << EC.message() << "\n";
-    llvm_unreachable("Could not open output file for command line arguments");
-  }
-
-  auto Str = MemoryBuffer::getFileAsStream("/proc/self/cmdline");
-  if (!Str) {
-    errs() << "Could not read command line arguments: " << Str.getError().message() << "\n";
-    llvm_unreachable("Could not read command line arguments");
-  }
-  CmdLine << Str.get()->getBuffer().str();
-
-  std::string FileName = "Pre_Segments.txt";
-  sys::fs::openFileForWrite(ModDir + FileName, OutFD[0], sys::fs::CreationDisposition::CD_CreateAlways, sys::fs::OF_None);
-  FileName = "Post_Segments_.txt";
-  sys::fs::openFileForWrite(ModDir + FileName, OutFD[1], sys::fs::CreationDisposition::CD_CreateAlways, sys::fs::OF_None);
-
-  FileName = "Mod_full1.ll";
-  auto Opt = raw_fd_ostream(ModDir + FileName, EC, sys::fs::CreationDisposition::CD_CreateAlways);
+  auto FullName = "Mod_full1.ll";
+  auto Opt = raw_fd_ostream(ModDir + FullName, EC, sys::fs::CreationDisposition::CD_CreateAlways);
 
   LKMMAnnotateDeps Ret;
 
   {
     auto A = LKMMSearchPolicy::LKMMAnnotator(CK_Annot, &annotateChain);
-    Ret.add(DepType::ADDR, A.run<DepType::ADDR>(M, AM));
-    Ret.add(DepType::DATA, A.run<DepType::DATA>(M, AM));
-    Ret.add(DepType::CTRL, A.run<DepType::CTRL>(M, AM, true));
+    Ret.add(DepType::ADDR, A.run<DepType::ADDR>(*AnalyzeMod, AM));
+    Ret.add(DepType::DATA, A.run<DepType::DATA>(*AnalyzeMod, AM));
+    Ret.add(DepType::CTRL, A.run<DepType::CTRL>(*AnalyzeMod, AM, true));
   }
 
-  Opt << M;
-  for (auto &F : M) {
-    if (F.hasFnAttribute("is_entry"))
+  Opt << *AnalyzeMod;
+  for (auto &F : *AnalyzeMod) {
+    if (F.hasFnAttribute("is_entry")) {
       saveMiniModule(&F, ModDir, "1");
+      Ret.EntryFunctions.insert(F.getName().str());
+    }
+  }
+
+  // When analyzing external pre-opt IR, transfer chain annotations
+  // (begins_*_dep, ends_*_dep, is_entry) to the post-opt module M.
+  // Match instructions by synthetic DILocation line number.
+  if (!PreoptIRPath.empty()) {
+    static constexpr StringRef DepMDNames[] = {
+      "begins_addr_dep", "begins_data_dep", "begins_ctrl_dep",
+      "ends_addr_dep",   "ends_data_dep",   "ends_ctrl_dep",
+    };
+
+    // Build map: synthetic line ID → {md_name → MDNode} from pre-opt.
+    // Keyed per function name to avoid cross-function collisions.
+    struct InstAnnotations {
+      SmallVector<std::pair<StringRef, MDNode *>, 4> MDs;
+    };
+    std::map<std::pair<std::string, unsigned>, InstAnnotations> SynthMap;
+
+    auto isSynthetic = [](const DebugLoc &DL) -> bool {
+      if (!DL)
+        return false;
+      auto *Scope = DL->getScope();
+      if (!Scope || !Scope->getFile())
+        return false;
+      return Scope->getFile()->getFilename().ends_with("lkmm-synthetic.src");
+    };
+
+    for (auto &F : *AnalyzeMod) {
+      for (auto &BB : F) {
+        for (auto &I : BB) {
+          auto DL = I.getDebugLoc();
+          if (!isSynthetic(DL))
+            continue;
+          unsigned SynthLine = DL->getLine();
+          if (SynthLine == 0)
+            continue;
+
+          auto Key = std::make_pair(F.getName().str(), SynthLine);
+          for (auto &MDName : DepMDNames) {
+            if (auto *MD = I.getMetadata(MDName))
+              SynthMap[Key].MDs.emplace_back(MDName, MD);
+          }
+        }
+      }
+    }
+
+    // Transfer annotations to M by matching synthetic line IDs.
+    // For merged instructions, walk !lkmm.merged_from to recover original
+    // synthetic lines.
+    for (auto &F : M) {
+      if (F.isDeclaration())
+        continue;
+      if (Ret.EntryFunctions.count(F.getName().str()))
+        F.addFnAttr(Attribute::get(F.getContext(), "is_entry"));
+
+      for (auto &BB : F) {
+        for (auto &I : BB) {
+          auto DL = I.getDebugLoc();
+          if (!isSynthetic(DL))
+            continue;
+
+          SmallVector<unsigned, 4> SynthLines;
+          unsigned Line = DL->getLine();
+          if (Line != 0) {
+            SynthLines.push_back(Line);
+          } else {
+            // Recover original synthetic lines from !lkmm.merged_from.
+            // The metadata contains ConstantAsMetadata i32 values.
+            if (auto *MF = I.getMetadata("lkmm.merged_from")) {
+              for (unsigned Idx = 0; Idx < MF->getNumOperands(); ++Idx) {
+                if (auto *CAM =
+                        dyn_cast<ConstantAsMetadata>(MF->getOperand(Idx))) {
+                  if (auto *CI = dyn_cast<ConstantInt>(CAM->getValue())) {
+                    unsigned L = CI->getZExtValue();
+                    if (L != 0)
+                      SynthLines.push_back(L);
+                  }
+                }
+              }
+            }
+          }
+
+          // Collect all annotations from all matching synthetic lines,
+          // merging operands for the same metadata name (e.g. two
+          // !ends_ctrl_dep from merged stores get their chain IDs unioned).
+          StringMap<SmallVector<Metadata *, 4>> Merged;
+          auto FuncName = F.getName().str();
+          for (unsigned SL : SynthLines) {
+            auto Key = std::make_pair(FuncName, SL);
+            auto It = SynthMap.find(Key);
+            if (It != SynthMap.end()) {
+              for (auto &[MDName, MD] : It->second.MDs) {
+                auto &Ops = Merged[MDName];
+                for (unsigned K = 0; K < MD->getNumOperands(); ++K)
+                  Ops.push_back(MD->getOperand(K));
+              }
+            }
+          }
+          for (auto &[MDName, Ops] : Merged)
+            I.setMetadata(MDName, MDTuple::get(I.getContext(), Ops));
+        }
+      }
+    }
   }
 
   return Ret;

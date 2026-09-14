@@ -426,6 +426,7 @@ public:
   class DCLink;
 
   DepMap *IntactDeps[3];
+  std::set<std::string> EntryFunctions;
 
   // never invalidate this
   bool invalidate(Module &, const PreservedAnalyses &PA,

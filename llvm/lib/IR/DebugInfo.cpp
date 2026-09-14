@@ -956,7 +956,38 @@ unsigned llvm::getDebugMetadataVersionFromModule(const Module &M) {
 }
 
 void Instruction::applyMergedLocation(DebugLoc LocA, DebugLoc LocB) {
-  setDebugLoc(DebugLoc::getMergedLocation(LocA, LocB));
+  DebugLoc Merged = DebugLoc::getMergedLocation(LocA, LocB);
+
+  // When merging locations on an instruction with !lkmm.primitive metadata,
+  // preserve the original synthetic line numbers so the annotation transfer
+  // pass can recover them (getMergedLocation zeros conflicting lines).
+  // We store just the line numbers as ConstantAsMetadata integers to avoid
+  // the verifier rejecting DILocations inside generic metadata tuples.
+  if (getMetadata(LLVMContext::MD_lkmm_primitive) && LocA && LocB &&
+      LocA.get() != LocB.get()) {
+    // Walk through inlinedAt chains to find the synthetic scope lines.
+    auto getSynthLine = [](const DILocation *DL) -> unsigned {
+      for (auto *L = DL; L; L = L->getInlinedAt()) {
+        auto *Scope = L->getScope();
+        if (Scope && Scope->getFile() &&
+            Scope->getFile()->getFilename().ends_with("lkmm-synthetic.src"))
+          return L->getLine();
+      }
+      return 0;
+    };
+    unsigned LineA = getSynthLine(LocA.get());
+    unsigned LineB = getSynthLine(LocB.get());
+    if (LineA != 0 || LineB != 0) {
+      LLVMContext &C = getContext();
+      Type *I32Ty = Type::getInt32Ty(C);
+      Metadata *Ops[] = {
+          ConstantAsMetadata::get(ConstantInt::get(I32Ty, LineA)),
+          ConstantAsMetadata::get(ConstantInt::get(I32Ty, LineB))};
+      setMetadata("lkmm.merged_from", MDTuple::get(C, Ops));
+    }
+  }
+
+  setDebugLoc(Merged);
 }
 
 void Instruction::mergeDIAssignID(
